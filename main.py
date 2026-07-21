@@ -106,7 +106,7 @@ plotSatID   = True      # If True, plots the ID of each satellite
 plotAllThro = False      # If True, it plots throughput plots for each single path between gateways. If False, it plots a single figure for overall Throughput
 plotAllCon  = False      # If True, it plots congestion maps for each single path between gateways. If False, it plots a single figure for overall congestion
 
-movementTime= 10        # Every movementTime seconds, the satellites positions are updated and the graph is built again
+movementTime= 0.1        # Every movementTime seconds, the satellites positions are updated and the graph is built again
                         # If do not want the constellation to move, set this parameter to a bigger number than the simulation time
 ndeltas     = 5805.44/20#1 Movement speedup factor. Every movementTime sats will move movementTime*ndeltas space. If bigger, will make the rotation distance bigger
 
@@ -163,7 +163,7 @@ BLOCK_SIZE   = 64800
 # movementTime= 0.05      # Every movementTime seconds, the satellites positions are updated and the graph is built again
 #                         # If do not want the constellation to move, set this parameter to a bigger number than the simulation time
 # ndeltas     = 5805.44/20#1 Movement speedup factor. This number will multiply deltaT. If bigger, will make the rotation distance bigger
-saveISLs    = True     # save ISLs map
+saveISLs    = False     # save ISLs map
 const_moved = False     # Movement flag. If up, it means it has moved
 matching    = 'Greedy'  # ['Markovian', 'Greedy']
 minElAngle  = 30        # For satellites. Value is taken from NGSO constellation design chapter.
@@ -1859,7 +1859,8 @@ class Gateway:
 
         # split the traffic evenly among the active gateways while keeping the fraction to each gateway the same
         # regardless of number of active gateways
-        flow = self.totalAvgFlow / (len(self.totalLocations) - 1)
+        # flow = self.totalAvgFlow / (len(self.totalLocations) - 1)
+        flow = self.totalAvgFlow / 2
 
         avgTime = block.size / flow  # the average time to fill the buffer in seconds
 
