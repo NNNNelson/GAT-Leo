@@ -87,16 +87,23 @@ from collections import deque
 GAT_K_HOPS = 1          # 可改为 1 / 2 / 3
 GAT_HEADS = 4
 GAT_HIDDEN_DIM = 32
-GAT_FEATURE_DIM = 14
+GAT_FEATURE_NAMES = (
+    'buffer_utilization',
+    'multiscale_queue_trend',
+    'relative_longitude',
+    'relative_latitude',
+    'is_destination'
+)
+GAT_FEATURE_DIM = len(GAT_FEATURE_NAMES)
 
 # GAT 网络不能加载旧的全连接 qNetwork_*.h5
-gat_nnpath = './Results/GAT-DQN_6.0s_[50]_Del_[20]_w1_[20]_w2_[2]_GTs-f=0.8-kepler/NNs/gat_qNetwork_2GTs.keras'    
-gat_nnpathTarget = './Results/GAT-DQN_6.0s_[50]_Del_[20]_w1_[20]_w2_[2]_GTs-f=0.8-kepler/NNs/gat_qTarget_2GTs.keras'
+gat_nnpath = './NNs/gat_qNetwork_2GTs.keras'    
+gat_nnpathTarget = './NNs/gat_qTarget_2GTs.keras'
 
 # HOT PARAMS - This parameters should be revised before every simulation
 pathings    = ['hop', 'dataRate', 'dataRateOG', 'slant_range', 'Q-Learning', 'Deep Q-Learning', 'GAT-DQN']
 #pathing     = pathings[5]# dataRateOG is the original datarate. If we want to maximize the datarate we have to use dataRate, which is the inverse of the datarate
-pathing = 'Q-Learning'
+pathing = 'GAT-DQN'
 
 RL_PATHINGS = ('Q-Learning', 'Deep Q-Learning', 'GAT-DQN')
 DEEP_RL_PATHINGS = ('Deep Q-Learning', 'GAT-DQN')
@@ -109,10 +116,12 @@ plotAllCon  = False      # If True, it plots congestion maps for each single pat
 movementTime= 0.1        # Every movementTime seconds, the satellites positions are updated and the graph is built again
                         # If do not want the constellation to move, set this parameter to a bigger number than the simulation time
 ndeltas     = 5805.44/20#1 Movement speedup factor. Every movementTime sats will move movementTime*ndeltas space. If bigger, will make the rotation distance bigger
+ENABLE_QUEUE_SAMPLING = True  # If True, record periodic satellite queue snapshots to CSV
+QUEUE_SAMPLE_INTERVAL_S = 0.0005  # Fixed simulation-time interval for satellite queue snapshots
 
-Train       = True      # Global for all scenarios with different number of GTs. if set to false, the model will not train any of them
-explore     = True      # If True, makes random actions eventually, if false only exploitation
-importQVals = False     # imports either QTables or NN from a certain path
+Train       = False      # Global for all scenarios with different number of GTs. if set to false, the model will not train any of them
+explore     = False      # If True, makes random actions eventually, if false only exploitation
+importQVals = True     # imports either QTables or NN from a certain path
 onlinePhase = False     # when set to true, each satellite becomes a different agent. Recommended using this with importQVals=True and explore=False
 if onlinePhase:         # Just in case
     explore     = False
@@ -160,6 +169,28 @@ avUserLoad  = 8593 * 8      # average traffic usage per second in bits
 BLOCK_SIZE   = 648000
 SAT_BUFFER_CAPACITY_BLOCKS = 100
 SAT_BUFFER_CAPACITY_BITS = SAT_BUFFER_CAPACITY_BLOCKS * BLOCK_SIZE
+
+# Queue-trend state used by DQN/GAT-DQN.
+# A reference rate represents a 10-block change over its time window for the
+# default 100-block satellite buffer.
+QUEUE_TREND_SHORT_WINDOW_S = 0.030
+QUEUE_TREND_LONG_WINDOW_S = 0.080
+QUEUE_TREND_HISTORY_WINDOW_S = 0.100
+QUEUE_TREND_REFERENCE_BUFFER_FRACTION = 0.10
+QUEUE_TREND_SHORT_REFERENCE_RATE = (
+    QUEUE_TREND_REFERENCE_BUFFER_FRACTION / QUEUE_TREND_SHORT_WINDOW_S
+)
+QUEUE_TREND_LONG_REFERENCE_RATE = (
+    QUEUE_TREND_REFERENCE_BUFFER_FRACTION / QUEUE_TREND_LONG_WINDOW_S
+)
+QUEUE_TREND_SHORT_WEIGHT = 0.60
+QUEUE_TREND_LONG_WEIGHT = 0.40
+QUEUE_TREND_DIRECTION_SENSITIVITY = 1.50
+QUEUE_TREND_MAGNITUDE_SENSITIVITY = 1.50
+QUEUE_TREND_EPSILON = 1e-12
+QUEUE_TREND_HISTORY_MAX_SAMPLES = (
+    int(math.ceil(QUEUE_TREND_HISTORY_WINDOW_S / QUEUE_SAMPLE_INTERVAL_S)) + 2
+)
 
 # Movement and structure
 # movementTime= 0.05      # Every movementTime seconds, the satellites positions are updated and the graph is built again
@@ -395,6 +426,122 @@ def simProgress(simTimelimit, env):
         print("Simulation progress: {}% Estimated time remaining: {} seconds Current simulation time: {}".format(progress, int(estimatedTimeRemaining), env.now), end='\r')
         yield env.timeout(timeStepSize)
         progress += 1
+
+
+QUEUE_SNAPSHOT_COLUMNS = [
+    'sample_index',
+    'time_s',
+    'sat_id',
+    'total_blocks',
+    'isl_u_blocks',
+    'isl_d_blocks',
+    'isl_r_blocks',
+    'isl_l_blocks',
+    'gsl_blocks'
+]
+
+
+def countWaitingBlocks(send_buffer):
+    """Count resident blocks that have not started transmission."""
+    return sum(
+        1 for block in send_buffer[1]
+        if block.status == 'queued'
+    )
+
+
+def countDirectionalWaitingBlocks(sat, linked_sats, direction):
+    """Return a directional ISL waiting count, or -1 when the link is absent."""
+    peer = linked_sats[direction]
+    if peer is None:
+        return -1
+
+    buffers = (
+        sat.sendBufferSatsIntra
+        if direction in ('U', 'D')
+        else sat.sendBufferSatsInter
+    )
+    send_buffer = next(
+        (buffer for buffer in buffers if buffer[2] == peer.ID),
+        None
+    )
+    if send_buffer is None:
+        return -1
+
+    return countWaitingBlocks(send_buffer)
+
+
+def collectSatelliteQueueSnapshot(earth, sample_index, record_snapshot=True):
+    """Update online queue histories and optionally record CSV snapshot rows."""
+    for plane in earth.LEO:
+        for sat in plane.sats:
+            sat.recordQueueTrendSample(earth.env.now)
+
+            if not record_snapshot:
+                continue
+
+            linked_sats = getLinkedSats(sat, earth.graph, earth)
+            waiting_block_ids = {
+                block.ID
+                for send_buffer in sat.allSendBuffers()
+                for block in send_buffer[1]
+                if block.status == 'queued'
+            }
+
+            earth.queueSnapshots.append({
+                'sample_index': sample_index,
+                'time_s': float(earth.env.now),
+                'sat_id': sat.ID,
+                'total_blocks': len(waiting_block_ids),
+                'isl_u_blocks': countDirectionalWaitingBlocks(
+                    sat, linked_sats, 'U'
+                ),
+                'isl_d_blocks': countDirectionalWaitingBlocks(
+                    sat, linked_sats, 'D'
+                ),
+                'isl_r_blocks': countDirectionalWaitingBlocks(
+                    sat, linked_sats, 'R'
+                ),
+                'isl_l_blocks': countDirectionalWaitingBlocks(
+                    sat, linked_sats, 'L'
+                ),
+                'gsl_blocks': (
+                    -1
+                    if sat.linkedGT is None
+                    else countWaitingBlocks(sat.sendBufferGT)
+                )
+            })
+
+
+def monitorSatelliteQueues(env, earth, interval, record_snapshots=True):
+    """Sample online queue state on a fixed simulation-time grid."""
+    if interval <= 0:
+        raise ValueError('Queue sample interval must be greater than zero')
+
+    sample_index = 0
+    while True:
+        collectSatelliteQueueSnapshot(
+            earth,
+            sample_index,
+            record_snapshot=record_snapshots
+        )
+        sample_index += 1
+        next_sample_time = sample_index * interval
+        yield env.timeout(next_sample_time - env.now)
+
+
+def saveSatelliteQueueSnapshots(earth, output_path, gt_number):
+    """Persist the satellite queue snapshots with a stable column order."""
+    csv_path = os.path.join(output_path, 'csv')
+    os.makedirs(csv_path, exist_ok=True)
+    file_path = os.path.join(
+        csv_path,
+        'satellite_queue_snapshots_{}_gateways.csv'.format(gt_number)
+    )
+    pd.DataFrame(
+        earth.queueSnapshots,
+        columns=QUEUE_SNAPSHOT_COLUMNS
+    ).to_csv(file_path, index=False)
+    return file_path
 
 
 ###############################################################################
@@ -925,6 +1072,14 @@ class Satellite:
         self.overflow_drops = 0
         self.overflow_drop_bits = 0
         self.buffer_history = []
+        self.queue_trend_history = deque(
+            maxlen=QUEUE_TREND_HISTORY_MAX_SAMPLES
+        )
+        self.queue_short_rate = 0.0
+        self.queue_long_rate = 0.0
+        self.multiscale_queue_trend_feature = 0.0
+        self.queue_trend_ready = False
+        self._queue_trend_cache_time = None
         self.sats = []
         self.linkedGT = None
         self.GTDist = None
@@ -978,6 +1133,135 @@ class Satellite:
         if self.buffer_capacity_bits <= 0:
             return 1.0
         return self.buffer_used_bits / self.buffer_capacity_bits
+
+    def recordQueueTrendSample(self, sample_time=None):
+        """Store one shared-buffer sample and keep only the latest 100 ms."""
+        if sample_time is None:
+            sample_time = self.env.now
+
+        sample_time = float(sample_time)
+        sample = (sample_time, float(self.buffer_utilization))
+
+        if (
+            self.queue_trend_history
+            and abs(self.queue_trend_history[-1][0] - sample_time)
+            <= QUEUE_TREND_EPSILON
+        ):
+            self.queue_trend_history[-1] = sample
+        else:
+            self.queue_trend_history.append(sample)
+
+        oldest_allowed = sample_time - QUEUE_TREND_HISTORY_WINDOW_S
+        while (
+            self.queue_trend_history
+            and self.queue_trend_history[0][0]
+            < oldest_allowed - QUEUE_TREND_EPSILON
+        ):
+            self.queue_trend_history.popleft()
+
+        self._queue_trend_cache_time = None
+
+    def _queueWindowSlope(self, window_s):
+        """Return the OLS slope of buffer utilisation over a complete window."""
+        if len(self.queue_trend_history) < 2:
+            return None
+
+        current_time = self.queue_trend_history[-1][0]
+        window_start = current_time - window_s
+        samples = [
+            (sample_time, utilization)
+            for sample_time, utilization in self.queue_trend_history
+            if sample_time >= window_start - QUEUE_TREND_EPSILON
+        ]
+
+        if (
+            len(samples) < 2
+            or current_time - samples[0][0]
+            < window_s - QUEUE_TREND_EPSILON
+        ):
+            return None
+
+        mean_time = sum(sample[0] for sample in samples) / len(samples)
+        mean_utilization = sum(sample[1] for sample in samples) / len(samples)
+        numerator = sum(
+            (sample_time - mean_time) * (utilization - mean_utilization)
+            for sample_time, utilization in samples
+        )
+        denominator = sum(
+            (sample_time - mean_time) ** 2
+            for sample_time, _ in samples
+        )
+
+        return numerator / (denominator + QUEUE_TREND_EPSILON)
+
+    def _updateQueueTrendFeatures(self):
+        """Update the cached signed rate response and nonlinear trend feature."""
+        if not self.queue_trend_history:
+            return
+
+        latest_sample_time = self.queue_trend_history[-1][0]
+        if self._queue_trend_cache_time == latest_sample_time:
+            return
+
+        short_rate = self._queueWindowSlope(QUEUE_TREND_SHORT_WINDOW_S)
+        long_rate = self._queueWindowSlope(QUEUE_TREND_LONG_WINDOW_S)
+
+        if short_rate is None or long_rate is None:
+            self.queue_short_rate = 0.0
+            self.queue_long_rate = 0.0
+            self.multiscale_queue_trend_feature = 0.0
+            self.queue_trend_ready = False
+            self._queue_trend_cache_time = latest_sample_time
+            return
+
+        if abs(short_rate) <= QUEUE_TREND_EPSILON:
+            short_rate = 0.0
+        if abs(long_rate) <= QUEUE_TREND_EPSILON:
+            long_rate = 0.0
+
+        short_normalized = short_rate / QUEUE_TREND_SHORT_REFERENCE_RATE
+        long_normalized = long_rate / QUEUE_TREND_LONG_REFERENCE_RATE
+        signed_rate = (
+            QUEUE_TREND_SHORT_WEIGHT * short_normalized
+            + QUEUE_TREND_LONG_WEIGHT * long_normalized
+        )
+        rate_magnitude = (
+            QUEUE_TREND_SHORT_WEIGHT * abs(short_normalized)
+            + QUEUE_TREND_LONG_WEIGHT * abs(long_normalized)
+        )
+
+        direction_response = math.tanh(
+            QUEUE_TREND_DIRECTION_SENSITIVITY * signed_rate
+        )
+        magnitude_response = math.tanh(
+            QUEUE_TREND_MAGNITUDE_SENSITIVITY * rate_magnitude
+        )
+        multiscale_feature = (
+            direction_response * magnitude_response
+        )
+
+        if not (
+            math.isfinite(short_rate)
+            and math.isfinite(long_rate)
+            and math.isfinite(direction_response)
+            and math.isfinite(multiscale_feature)
+        ):
+            short_rate = 0.0
+            long_rate = 0.0
+            multiscale_feature = 0.0
+            self.queue_trend_ready = False
+        else:
+            self.queue_trend_ready = True
+
+        self.queue_short_rate = short_rate
+        self.queue_long_rate = long_rate
+        self.multiscale_queue_trend_feature = multiscale_feature
+        self._queue_trend_cache_time = latest_sample_time
+
+    def getMultiscaleQueueTrendFeature(self):
+        """Return the signed two-scale tanh-product feature in [-1, 1]."""
+        self._updateQueueTrendFeatures()
+        return self.multiscale_queue_trend_feature
 
     def recordBufferEvent(self, event_type, block):
         self.buffer_history.append({
@@ -2330,6 +2614,7 @@ class Earth:
         }
         self.dropBits = {reason: 0 for reason in self.dropCounts}
         self.queues = []
+        self.queueSnapshots = []
         self.loss   = []
         self.lossAv = []
         self.DDQNA  = None
@@ -4954,6 +5239,18 @@ class GATDQNAgent:
 
             self.qTarget = keras.models.load_model(gat_nnpathTarget)
 
+            for model_name, model in (
+                ('Q-network', self.qNetwork),
+                ('target network', self.qTarget)
+            ):
+                loaded_feature_dim = int(model.input_shape[0][-1])
+                if loaded_feature_dim != self.featureDim:
+                    raise ValueError(
+                        f'Imported GAT {model_name} expects '
+                        f'{loaded_feature_dim} node features, but the current '
+                        f'state uses {self.featureDim}. Retrain the GAT model.'
+                    )
+
             print(f'GAT Q-network imported: {gat_nnpath}')
             print(f'GAT target network imported: {gat_nnpathTarget}')
 
@@ -6603,24 +6900,33 @@ def _wrapped_longitude_difference(lon_to, lon_from):
 
 
 def _relative_coordinates(source_sat, target_sat):
-    """target 相对 source 的归一化经纬度差。"""
+    """Return target-relative longitude/latitude differences in [-1, 1]."""
     source_lat = math.degrees(source_sat.latitude)
     source_lon = math.degrees(source_sat.longitude)
     target_lat = math.degrees(target_sat.latitude)
     target_lon = math.degrees(target_sat.longitude)
 
     return [
-        (target_lat - source_lat) / 180.0,
-        _wrapped_longitude_difference(target_lon, source_lon) / 180.0
+        _wrapped_longitude_difference(target_lon, source_lon) / 180.0,
+        (target_lat - source_lat) / 180.0
     ]
+
+
+def getSatelliteMultiscaleQueueTrendFeature(sat):
+    """Framework-neutral signed multi-scale queue trend for DQN/GAT inputs."""
+    if sat is None:
+        return 0.0
+    return float(sat.getMultiscaleQueueTrendFeature())
 
 
 def _normalised_queue_features(sat):
     """
-    输出卫星自身 U/D/R/L 四个发送队列。
-    getDeepSatScore 后范围为 [0, queueVals]，这里归一化至 [0, 1]。
+    返回缓存利用率和多尺度队列趋势两个动态特征。
     """
-    return sat.directionalBufferRatios()
+    return [
+        min(max(float(sat.buffer_utilization), 0.0), 1.0),
+        getSatelliteMultiscaleQueueTrendFeature(sat)
+    ]
 
 
 def _live_directional_neighbours(sat, graph, earth):
@@ -6762,23 +7068,13 @@ def build_gat_k_hop_state(block, root_sat, graph, earth, k_hops):
 
     action_mask = (action_nodes >= 0).astype(np.float32)
 
-    previous_satellite_id = _get_previous_satellite_id(block)
     feature_rows = []
 
     for sat in nodes:
-        latitude = math.degrees(sat.latitude) / 90.0
-        longitude = math.degrees(sat.longitude) / 180.0
-
         feature_rows.append(
             _normalised_queue_features(sat)
-            + [latitude, longitude]
             + _relative_coordinates(sat, destination_sat)
-            + _relative_coordinates(root_sat, sat)
-            + [
-                float(sat.ID == root_sat.ID),
-                float(sat.ID == destination_sat.ID),
-                float(str(sat.ID) == previous_satellite_id)
-            ]
+            + [float(sat.ID == destination_sat.ID)]
         )
 
     node_features = np.asarray(feature_rows, dtype=np.float32)
@@ -6787,7 +7083,7 @@ def build_gat_k_hop_state(block, root_sat, graph, earth, k_hops):
     assert adjacency.shape == (num_nodes, num_nodes)
 
     return {
-        'x': node_features,                 # [N_k, 14]
+        'x': node_features,                 # [N_k, 5]
         'adj': adjacency,                   # [N_k, N_k]
         'node_ids': tuple(sat.ID for sat in nodes),
         'action_nodes': action_nodes,       # [4]
@@ -7965,9 +8261,25 @@ def RunSimulation(GTs, inputPath, outputPath, populationData, radioKM):
         print('----------------------------------')
 
         progress = env.process(simProgress(simulationTimelimit, env))
+        if ENABLE_QUEUE_SAMPLING or pathing in DEEP_RL_PATHINGS:
+            env.process(
+                monitorSatelliteQueues(
+                    env,
+                    earth1,
+                    QUEUE_SAMPLE_INTERVAL_S,
+                    record_snapshots=ENABLE_QUEUE_SAMPLING
+                )
+            )
         startTime = time.time()
         env.run(simulationTimelimit)
         timeToSim = time.time() - startTime
+        if ENABLE_QUEUE_SAMPLING:
+            queueSnapshotFile = saveSatelliteQueueSnapshots(
+                earth1,
+                outputPath,
+                GTnumber
+            )
+            print(f'Satellite queue snapshots saved to: {queueSnapshotFile}')
 
         if testType == "Rates":
             plotRatesFigures()
