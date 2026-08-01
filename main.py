@@ -87,7 +87,7 @@ from collections import deque
 GAT_K_HOPS = 1          # 可改为 1 / 2 / 3
 GAT_HEADS = 4
 GAT_HIDDEN_DIM = 32
-GAT_FEATURE_DIM = 13
+GAT_FEATURE_DIM = 14
 
 # GAT 网络不能加载旧的全连接 qNetwork_*.h5
 gat_nnpath = './Results/GAT-DQN_6.0s_[50]_Del_[20]_w1_[20]_w2_[2]_GTs-f=0.8-kepler/NNs/gat_qNetwork_2GTs.keras'    
@@ -96,7 +96,7 @@ gat_nnpathTarget = './Results/GAT-DQN_6.0s_[50]_Del_[20]_w1_[20]_w2_[2]_GTs-f=0.
 # HOT PARAMS - This parameters should be revised before every simulation
 pathings    = ['hop', 'dataRate', 'dataRateOG', 'slant_range', 'Q-Learning', 'Deep Q-Learning', 'GAT-DQN']
 #pathing     = pathings[5]# dataRateOG is the original datarate. If we want to maximize the datarate we have to use dataRate, which is the inverse of the datarate
-pathing = 'GAT-DQN'
+pathing = 'Q-Learning'
 
 RL_PATHINGS = ('Q-Learning', 'Deep Q-Learning', 'GAT-DQN')
 DEEP_RL_PATHINGS = ('Deep Q-Learning', 'GAT-DQN')
@@ -157,7 +157,9 @@ totalFlow   = 2*1000000000  # Total average flow per GT when the balanced traffc
 avUserLoad  = 8593 * 8      # average traffic usage per second in bits
 
 # Block
-BLOCK_SIZE   = 64800
+BLOCK_SIZE   = 648000
+SAT_BUFFER_CAPACITY_BLOCKS = 100
+SAT_BUFFER_CAPACITY_BITS = SAT_BUFFER_CAPACITY_BLOCKS * BLOCK_SIZE
 
 # Movement and structure
 # movementTime= 0.05      # Every movementTime seconds, the satellites positions are updated and the graph is built again
@@ -208,6 +210,7 @@ ArriveReward= 50        # Reward given to the system in case it sends the data b
 # w4          = 5         # Normalization for the distance reward, for the traveled distance factor  
 againPenalty= -10       # Penalty if the satellite sends the block to a hop where it has already been
 unavPenalty = -10       # Penalty if the satellite tries to send the block to a direction where there is no linked satellite
+BUFFER_OVERFLOW_REWARD = -50.0  # Terminal reward when the selected next satellite rejects a full block
 biggestDist = -1        # Normalization factor for the distance reward. This is updated in the creation of the graph.
 firstMove   = True      # The biggest slant range is only computed the first time in order to avoid this value to be variable
 distanceRew = 4          # 1: Distance reward normalized to total distance.
@@ -288,10 +291,25 @@ def getBlockTransmissionStats(timeToSim, GTs, constellationType, earth):
 
     earth.pathParam
 
-    for block in receivedDataBlocks:
+    delivered_blocks = [block for block in createdBlocks if block.delivered]
+    dropped_blocks = [block for block in createdBlocks if block.dropped]
+    unfinished_blocks = [
+        block for block in createdBlocks
+        if not block.delivered and not block.dropped
+    ]
+
+    for block in unfinished_blocks:
+        block.status = 'unfinished'
+        if block.timeAtFull is not None:
+            block.timeInNetwork = earth.env.now - block.timeAtFull
+
+    # Persist every full block, including delivered, dropped, and unfinished blocks.
+    blocks = [BlocksForPickle(block) for block in createdBlocks]
+
+    # End-to-end latency and throughput only describe successfully delivered blocks.
+    for block in delivered_blocks:
         time = block.getTotalTransmissionTime()
         hops = len(block.checkPoints)
-        blocks.append(BlocksForPickle(block))
 
         if largestTransmissionTime[0] < time:
             largestTransmissionTime = (time, block)
@@ -305,11 +323,11 @@ def getBlockTransmissionStats(timeToSim, GTs, constellationType, earth):
         txLat.append(block.txLatency)
         propLat.append(block.propLatency)
         
-        # [creation time, total latency, arrival time, source, destination, block ID, queue time, transmission latency, prop latency]
-        allLatencies.append([block.creationTime, block.totLatency, block.creationTime+block.totLatency, block.source.name, block.destination.name, block.ID, block.getQueueTime()[0], block.txLatency, block.propLatency])
+        # timeAtFull is the network-entry time; gateway block-filling time is excluded.
+        allLatencies.append([block.timeAtFull, block.totLatency, block.terminalTime, block.source.name, block.destination.name, block.ID, block.getQueueTime()[0], block.txLatency, block.propLatency])
         # pre-process the received data blocks. create the rows that will be saved in csv
         if block.source == first and block.destination == second:
-            pathBlocks[0].append([block.totLatency, block.creationTime+block.totLatency])
+            pathBlocks[0].append([block.totLatency, block.terminalTime])
             pathBlocks[1].append(block)
         
     # save congestion test data
@@ -323,30 +341,44 @@ def getBlockTransmissionStats(timeToSim, GTs, constellationType, earth):
     except pickle.PicklingError:
         print('Error with pickle and profiling')
 
-    avgTime = np.mean(allTransmissionTimes)
+    earth.saveBlockDropRecords(blockPath)
+
+    avgTime = np.mean(allTransmissionTimes) if allTransmissionTimes else np.nan
     totalTime = sum(allTransmissionTimes)
+    meanQueueLatency = np.mean(queueLat) if queueLat else np.nan
+    meanPropLatency = np.mean(propLat) if propLat else np.nan
+    meanTransLatency = np.mean(txLat) if txLat else np.nan
+    perQueueLatency = sum(queueLat) / totalTime * 100 if totalTime > 0 else 0.0
+    perPropLatency = sum(propLat) / totalTime * 100 if totalTime > 0 else 0.0
+    perTransLatency = sum(txLat) / totalTime * 100 if totalTime > 0 else 0.0
 
     print("\n########## Results #########\n")
     print(f"The simulation took {timeToSim} seconds to run")
     print(f"A total of {len(createdBlocks)} data blocks were created")
-    print(f"A total of {len(receivedDataBlocks)} data blocks were transmitted")
-    print(f"A total of {len(createdBlocks) - len(receivedDataBlocks)} data blocks were stuck")
+    print(f"A total of {len(delivered_blocks)} data blocks were delivered")
+    print(f"A total of {len(dropped_blocks)} data blocks were dropped")
+    print(f"A total of {len(unfinished_blocks)} data blocks were unfinished")
+    print(f"Buffer overflow drops: {earth.dropCounts['buffer_overflow']}")
     print(f"Average transmission time for all blocks were {avgTime}")
     print('Total latecies:\nQueue time: {}%\nTransmission time: {}%\nPropagation time: {}%'.format(
-        '%.4f' % float(sum(queueLat)/totalTime*100),
-        '%.4f' % float(sum(txLat)/totalTime*100),
-        '%.4f' % float(sum(propLat)/totalTime*100)))
+        '%.4f' % float(perQueueLatency),
+        '%.4f' % float(perTransLatency),
+        '%.4f' % float(perPropLatency)))
+
+    assert len(createdBlocks) == (
+        len(delivered_blocks) + len(dropped_blocks) + len(unfinished_blocks)
+    )
 
     results = Results(finishedBlocks=blocks,
                       constellation=constellationType,
                       GTs=GTs,
                       meanTotalLatency=avgTime,
-                      meanQueueLatency=np.mean(queueLat),
-                      meanPropLatency=np.mean(propLat),
-                      meanTransLatency=np.mean(txLat),
-                      perQueueLatency = sum(queueLat)/totalTime*100,
-                      perPropLatency = sum(propLat)/totalTime*100,
-                      perTransLatency = sum(txLat)/totalTime*100)
+                      meanQueueLatency=meanQueueLatency,
+                      meanPropLatency=meanPropLatency,
+                      meanTransLatency=meanTransLatency,
+                      perQueueLatency=perQueueLatency,
+                      perPropLatency=perPropLatency,
+                      perTransLatency=perTransLatency)
 
     return results, allLatencies, pathBlocks, blocks
 
@@ -722,6 +754,20 @@ class BlocksForPickle:
         self.propLatency = block.propLatency  # total propagation latency
         self.totLatency = block.totLatency  # total latency
         self.QPath = block.QPath # path followed due to Q-Learning
+        self.status = block.status
+        self.delivered = block.delivered
+        self.dropped = block.dropped
+        self.terminalTime = block.terminalTime
+        self.timeInNetwork = block.timeInNetwork
+        self.dropReason = block.dropReason
+        self.dropTime = block.dropTime
+        self.dropSatID = block.dropSatID
+        self.dropFromSatID = block.dropFromSatID
+        self.dropBufferUsedBits = block.dropBufferUsedBits
+        self.dropBufferCapacityBits = block.dropBufferCapacityBits
+        self.dropBufferUtilization = block.dropBufferUtilization
+        self.dropReward = block.dropReward
+        self.dropFeedbackStored = block.dropFeedbackStored
 
 
 class RFlink:
@@ -818,7 +864,7 @@ class OrbitalPlane:
 
 # @profile
 class Satellite:
-    def __init__(self, ID, in_plane, i_in_plane, h, longitude, inclination, n_sat, env, orbitalPlane, quota = 500, power = 10):
+    def __init__(self, ID, in_plane, i_in_plane, h, longitude, inclination, n_sat, env, orbitalPlane, quota=SAT_BUFFER_CAPACITY_BLOCKS, power=10):
         self.ID = ID                    # A unique ID given to every satellite
         self.orbPlane = orbitalPlane    # Pointer to the orbital plane which the sat belongs to
         self.in_plane = in_plane        # Orbital plane where the satellite is deployed
@@ -868,6 +914,17 @@ class Satellite:
         self.env = env
         self.sendBufferGT = ([env.event()], [])  # ([self.env.event()], [DataBlock(0, 0, "0", 0)])
         self.sendBlocksGT = []  # env.process(self.sendBlock())  # simpy processes which send the data blocks
+        # One physical FIFO memory shared by every ISL/GSL egress queue.
+        # quota is expressed in full DataBlocks for backward-compatible construction.
+        self.buffer_capacity_blocks = int(quota)
+        self.buffer_capacity_bits = self.buffer_capacity_blocks * BLOCK_SIZE
+        self.buffer_used_bits = 0
+        self.buffer_peak_bits = 0
+        self.buffered_block_ids = set()
+        self.accepted_blocks = 0
+        self.overflow_drops = 0
+        self.overflow_drop_bits = 0
+        self.buffer_history = []
         self.sats = []
         self.linkedGT = None
         self.GTDist = None
@@ -880,7 +937,6 @@ class Satellite:
         self.sendBufferSatsInter = []
         self.sendBlocksSatsIntra = []
         self.sendBlocksSatsInter = []
-        self.newBuffer  = [False]
 
         self.QLearning  = None  # Q-learning table that will be updated in case the pathing is 'Q-Learning'
         self.DDQNA      = None  # DDQN agent for each satellite. Only used in the online phase
@@ -917,6 +973,200 @@ class Satellite:
                 '%.2f' % math.degrees(self.latitude),
                 '%.2f' % math.degrees(self.longitude))
 
+    @property
+    def buffer_utilization(self):
+        if self.buffer_capacity_bits <= 0:
+            return 1.0
+        return self.buffer_used_bits / self.buffer_capacity_bits
+
+    def recordBufferEvent(self, event_type, block):
+        self.buffer_history.append({
+            'time': self.env.now,
+            'sat_id': self.ID,
+            'event': event_type,
+            'block_id': block.ID,
+            'used_bits': self.buffer_used_bits,
+            'capacity_bits': self.buffer_capacity_bits,
+            'utilization': self.buffer_utilization
+        })
+
+    def tryAdmitBlock(self, block):
+        """Atomically admit a fully received block to this satellite's shared memory."""
+        if block.ID in self.buffered_block_ids:
+            raise RuntimeError(
+                f'Duplicate arrival of resident block {block.ID} at satellite {self.ID}'
+            )
+
+        if block.size > self.buffer_capacity_bits:
+            return False
+
+        required_bits = self.buffer_used_bits + block.size
+        if required_bits > self.buffer_capacity_bits:
+            return False
+
+        self.buffer_used_bits = required_bits
+        self.buffer_peak_bits = max(self.buffer_peak_bits, self.buffer_used_bits)
+        self.buffered_block_ids.add(block.ID)
+        self.accepted_blocks += 1
+        block.bufferOwnerSatID = self.ID
+        block.status = 'queued'
+        self.recordBufferEvent('admit', block)
+        return True
+
+    def releaseBlock(self, block):
+        """Release a block once after a completed transmission or an admitted drop."""
+        if block.ID not in self.buffered_block_ids:
+            return False
+
+        self.buffered_block_ids.remove(block.ID)
+        self.buffer_used_bits -= block.size
+        if self.buffer_used_bits < 0:
+            raise RuntimeError(f'Negative buffer usage at satellite {self.ID}')
+
+        block.bufferOwnerSatID = None
+        self.recordBufferEvent('release', block)
+        return True
+
+    def enqueueAdmittedBlock(self, send_buffer, block):
+        """Append an already accounted block to an existing per-link FIFO queue."""
+        if block.ID not in self.buffered_block_ids:
+            raise RuntimeError(
+                f'Block {block.ID} was queued at satellite {self.ID} without admission'
+            )
+
+        for existing_buffer in self.allSendBuffers():
+            if any(queued_block.ID == block.ID for queued_block in existing_buffer[1]):
+                raise RuntimeError(
+                    f'Duplicate queue entry for block {block.ID} at satellite {self.ID}'
+                )
+
+        if not send_buffer[0][0].triggered:
+            send_buffer[0][0].succeed()
+            send_buffer[1].append(block)
+        else:
+            send_buffer[0].append(self.env.event().succeed())
+            send_buffer[1].append(block)
+        block.status = 'queued'
+
+    def allSendBuffers(self):
+        """Return every resident egress queue owned by this satellite."""
+        return (
+            list(self.sendBufferSatsIntra)
+            + list(self.sendBufferSatsInter)
+            + [self.sendBufferGT]
+        )
+
+    def assertBufferAccounting(self):
+        """Validate the one-resident-copy invariant for this satellite."""
+        queued_blocks = [
+            block
+            for send_buffer in self.allSendBuffers()
+            for block in send_buffer[1]
+        ]
+        queued_ids = [block.ID for block in queued_blocks]
+
+        if len(queued_ids) != len(set(queued_ids)):
+            duplicates = sorted({
+                block_id for block_id in queued_ids
+                if queued_ids.count(block_id) > 1
+            })
+            raise RuntimeError(
+                f'Duplicate queued blocks at satellite {self.ID}: {duplicates}'
+            )
+
+        queued_id_set = set(queued_ids)
+        if queued_id_set != self.buffered_block_ids:
+            missing_from_queues = sorted(self.buffered_block_ids - queued_id_set)
+            missing_from_accounting = sorted(
+                queued_id_set - self.buffered_block_ids
+            )
+            raise RuntimeError(
+                f'Buffer accounting mismatch at satellite {self.ID}; '
+                f'accounted-only={missing_from_queues}, '
+                f'queued-only={missing_from_accounting}'
+            )
+
+        queued_bits = sum(block.size for block in queued_blocks)
+        if queued_bits != self.buffer_used_bits:
+            raise RuntimeError(
+                f'Buffer bit count mismatch at satellite {self.ID}: '
+                f'queued={queued_bits}, accounted={self.buffer_used_bits}'
+            )
+
+        wrong_owners = [
+            block.ID for block in queued_blocks
+            if block.bufferOwnerSatID != self.ID
+        ]
+        if wrong_owners:
+            raise RuntimeError(
+                f'Wrong buffer owner at satellite {self.ID}: {wrong_owners}'
+            )
+
+    def rebuildInterSatelliteBuffers(self, neighbor_sats):
+        """
+        Atomically replace all inter-ISL queues and send processes.
+
+        Transmissions interrupted by a topology update remain accounted at this
+        satellite and are restarted on the queue selected by the updated route.
+        """
+        blocks_to_distribute = []
+        seen_ids = set()
+
+        for send_buffer in self.sendBufferSatsInter:
+            for block in send_buffer[1]:
+                if block.ID in seen_ids:
+                    raise RuntimeError(
+                        f'Duplicate inter-ISL block {block.ID} '
+                        f'at satellite {self.ID} before topology rebuild'
+                    )
+                seen_ids.add(block.ID)
+                arrival_time = (
+                    block.checkPoints[-1]
+                    if block.checkPoints else self.env.now
+                )
+                blocks_to_distribute.append((arrival_time, block))
+
+        for process in self.sendBlocksSatsInter:
+            if process.is_alive:
+                process.interrupt()
+
+        self.sendBufferSatsInter = []
+        self.sendBlocksSatsInter = []
+
+        for neighbor in neighbor_sats:
+            self.sendBufferSatsInter.append(
+                ([self.env.event()], [], neighbor[1].ID)
+            )
+            self.sendBlocksSatsInter.append(
+                self.env.process(self.sendBlock(neighbor, True, False))
+            )
+
+        return blocks_to_distribute
+
+    @staticmethod
+    def queueSizeBits(send_buffer):
+        return sum(block.size for block in send_buffer[1])
+
+    def directionalBufferRatios(self):
+        """Return U/D/R/L per-link occupancy plus total shared occupancy."""
+        ratios = []
+        directional_buffers = [
+            self.sendBufferSatsIntra[0] if len(self.sendBufferSatsIntra) > 0 else None,
+            self.sendBufferSatsIntra[1] if len(self.sendBufferSatsIntra) > 1 else None,
+            self.sendBufferSatsInter[0] if len(self.sendBufferSatsInter) > 0 else None,
+            self.sendBufferSatsInter[1] if len(self.sendBufferSatsInter) > 1 else None
+        ]
+        for send_buffer in directional_buffers:
+            if send_buffer is None:
+                ratios.append(1.0)
+            else:
+                ratios.append(min(
+                    self.queueSizeBits(send_buffer) / self.buffer_capacity_bits,
+                    1.0
+                ))
+        ratios.append(min(self.buffer_utilization, 1.0))
+        return ratios
+
     def createReceiveBlockProcess(self, block, propTime):
         """
         Function which starts a receiveBlock process upon receiving a block from a transmitter.
@@ -940,12 +1190,12 @@ class Satellite:
         of the send-buffer.
         """
         # wait for block to fully propagate
+        if block.status in ('delivered', 'dropped'):
+            return
         self.tempBlocks.append(block)
+        block.status = 'in_flight'
 
         yield self.env.timeout(propTime)
-
-        if block.path == -1:
-            return
 
         # KPI: propLatency receive block from sat
         block.propLatency += propTime
@@ -955,6 +1205,9 @@ class Satellite:
                 self.tempBlocks.pop(i)
                 break
 
+        if block.status in ('delivered', 'dropped'):
+            return
+
         try: # ANCHOR Save Queue time csv
             block.queueTime.append((block.checkPointsSend[len(block.checkPointsSend)-1]- block.checkPoints[len(block.checkPoints)-1]))
         except IndexError:  # Either it is the first satellite for the datablock or the datablock has no checkpoints appendeds
@@ -962,6 +1215,34 @@ class Satellite:
             pass
 
         block.checkPoints.append(self.env.now)
+
+        earth = self.orbPlane.earth
+        if block.path == -1:
+            record = earth.registerBlockDrop(
+                block, 'invalid_path', self, release_buffer=False
+            )
+            earth.applyDropRLFeedback(block, record)
+            return
+
+        if block.size > self.buffer_capacity_bits:
+            self.overflow_drops += 1
+            self.overflow_drop_bits += block.size
+            self.recordBufferEvent('block_too_large', block)
+            record = earth.registerBlockDrop(
+                block, 'block_too_large', self, release_buffer=False
+            )
+            earth.applyDropRLFeedback(block, record)
+            return
+
+        if not self.tryAdmitBlock(block):
+            self.overflow_drops += 1
+            self.overflow_drop_bits += block.size
+            self.recordBufferEvent('overflow', block)
+            record = earth.registerBlockDrop(
+                block, 'buffer_overflow', self, release_buffer=False
+            )
+            earth.applyDropRLFeedback(block, record)
+            return
 
         # if QLearning or Deep Q-Learning we:
         # Compute the next hop in the path and add it to the second last position (Last is the destination gateway)
@@ -983,7 +1264,13 @@ class Satellite:
                 else:
                     nextHop = self.orbPlane.earth.DDQNA.makeDeepAction(block, self, self.orbPlane.earth.gateways[0].graph, self.orbPlane.earth)
 
-            if nextHop != 0:
+            if nextHop == -1:
+                record = earth.registerBlockDrop(
+                    block, 'no_route', self, release_buffer=True
+                )
+                earth.applyDropRLFeedback(block, record)
+                return
+            elif nextHop != 0:
                 block.QPath.insert(len(block.QPath)-1 ,nextHop)
                 pathPlot = block.QPath.copy()
                 pathPlot.pop()
@@ -1010,19 +1297,17 @@ class Satellite:
             if self.ID == step[0]:
                 index = i
 
-        if not index:
-            print(path)
+        if index is None:
+            record = earth.registerBlockDrop(
+                block, 'invalid_path', self, release_buffer=True
+            )
+            earth.applyDropRLFeedback(block, record)
+            return
 
         # check if next step in path is GT (last step in path)
         if index == len(path) - 2:
             # add block to GT send-buffer
-            if not self.sendBufferGT[0][0].triggered:
-                self.sendBufferGT[0][0].succeed()
-                self.sendBufferGT[1].append(block)
-            else:
-                newEvent = self.env.event().succeed()
-                self.sendBufferGT[0].append(newEvent)
-                self.sendBufferGT[1].append(block)
+            self.enqueueAdmittedBlock(self.sendBufferGT, block)
 
         else:
             ID = None
@@ -1054,18 +1339,16 @@ class Satellite:
                 block.queue.append(len(sendBuffer[1]))
 
                 # add block to buffer
-                if not sendBuffer[0][0].triggered:
-                    sendBuffer[0][0].succeed()
-                    sendBuffer[1].append(block)
-                else:
-                    newEvent = self.env.event().succeed()
-                    sendBuffer[0].append(newEvent)
-                    sendBuffer[1].append(block)
+                self.enqueueAdmittedBlock(sendBuffer, block)
 
             else:
                 print(
                     "ERROR! Sat {} tried to send block to {} but did not have it in its linked satellite list".format(
                         self.ID, path[index + 1][0]))
+                record = earth.registerBlockDrop(
+                    block, 'no_route', self, release_buffer=True
+                )
+                earth.applyDropRLFeedback(block, record)
 
     def sendBlock(self, destination, isSat, isIntra = None):
         """
@@ -1096,14 +1379,19 @@ class Satellite:
             sendBuffer = self.sendBufferGT
 
         while True:
+            block = None
+            send_started_at = None
             try:
                 yield sendBuffer[0][0]
 
                 # ANCHOR KPI: queueLatency at sat
-                sendBuffer[1][0].checkPointsSend.append(self.env.now)
+                block = sendBuffer[1][0]
+                block.status = 'transmitting'
+                send_started_at = self.env.now
+                block.checkPointsSend.append(send_started_at)
 
                 if isSat:
-                    timeToSend = sendBuffer[1][0].size / destination[2]
+                    timeToSend = block.size / destination[2]
 
                     propTime = self.timeToSend(destination)
                     yield self.env.timeout(timeToSend)
@@ -1112,57 +1400,52 @@ class Satellite:
 
                 else:
                     propTime = self.timeToSend(self.linkedGT.linkedSat)
-                    timeToSend = sendBuffer[1][0].size / self.downRate
+                    timeToSend = block.size / self.downRate
                     yield self.env.timeout(timeToSend)
 
                     receiver = self.linkedGT
 
-                # When the constellations move, the only case where this process can simply continue, is when the
-                # receiver is the same, and there is a block already ready to be sent. The only place where the process
-                # can continue from, is as a result right here. Furthermore, the only processes this can happen for are
-                # the inter-ISL processes.
-                # Due to having to remake buffers when the satellites move, it is necessary for the process to "find"
-                # the correct buffer again - the process uses a reference to the buffer: "sendBuffer".
-                # To avoid remaking the reference every time a block is sent, the list of boolean values: self.newBuffer
-                # is used to indicate when the constellation is moved,
-
-                if True in self.newBuffer and not isIntra and isSat: # remake reference to buffer
-                    if isIntra is not None:
-                        sendBuffer = None
-                        if isSat:
-                            if isIntra:
-                                for buffer in self.sendBufferSatsIntra:
-                                    if buffer[2] == destination[1].ID:
-                                        sendBuffer = buffer
-                            else:
-                                for buffer in self.sendBufferSatsInter:
-                                    if buffer[2] == destination[1].ID:
-                                        sendBuffer = buffer
-                    else:
-                        sendBuffer = self.sendBufferGT
-
-                    for index, val in enumerate(self.newBuffer):
-                        if val: # each process will one by one remake their reference, and change one value to True.
-                                # After all processes has done this, all values are back to False
-                            self.newBuffer[index] = False
-                            break
-
                 # ANCHOR KPI: txLatency ISL
-                sendBuffer[1][0].txLatency += timeToSend
-                receiver.createReceiveBlockProcess(sendBuffer[1][0], propTime)
+                block.txLatency += timeToSend
 
-                # remove from own buffer
-                if len(sendBuffer[0]) == 1:
-                    sendBuffer[0].pop(0)
-                    sendBuffer[1].pop(0)
+                # Validate ownership before mutating the queue. Topology updates
+                # interrupt and replace inter-ISL processes instead of rebinding
+                # a live process to a different queue.
+                if block.ID not in self.buffered_block_ids:
+                    raise RuntimeError(
+                        f'Transmitted block {block.ID} was not accounted '
+                        f'at satellite {self.ID}'
+                    )
+
+                try:
+                    block_index = sendBuffer[1].index(block)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f'Transmitted block {block.ID} disappeared from satellite {self.ID}'
+                    ) from exc
+
+                sendBuffer[0].pop(block_index)
+                sendBuffer[1].pop(block_index)
+                if not sendBuffer[1]:
                     sendBuffer[0].append(self.env.event())
 
-                else:
-                    sendBuffer[0].pop(0)
-                    sendBuffer[1].pop(0)
+                if not self.releaseBlock(block):
+                    raise RuntimeError(
+                        f'Transmitted block {block.ID} was not accounted at satellite {self.ID}'
+                    )
+
+                block.status = 'in_flight'
+                receiver.createReceiveBlockProcess(block, propTime)
             except simpy.Interrupt:
-                # print(f'Simpy interrupt at sending block at satellite {self.ID} to {destination[1].ID}') # FIXME Are they really lost blocks?
-                # self.orbPlane.earth.lostBlocks+=1
+                # An interrupted frame remains resident and is retransmitted after rerouting.
+                if block is not None and block.status not in ('delivered', 'dropped'):
+                    if block.bufferOwnerSatID == self.ID:
+                        block.status = 'queued'
+                    if (
+                        block.checkPointsSend
+                        and block.checkPointsSend[-1] == send_started_at
+                    ):
+                        block.checkPointsSend.pop()
                 break
 
     def adjustDownRate(self):
@@ -1322,7 +1605,22 @@ class DataBlock:
         self.queueLatency = (None, None) # total time acumulated in the queues
         self.txLatency = 0      # total transmission time
         self.propLatency = 0    # total propagation latency
-        self.totLatency = 0     # total latency
+        self.totLatency = None  # delivered end-to-end latency, measured from timeAtFull
+        self.status = 'filling'
+        self.delivered = False
+        self.dropped = False
+        self.terminalTime = None
+        self.timeInNetwork = None
+        self.bufferOwnerSatID = None
+        self.dropReason = None
+        self.dropTime = None
+        self.dropSatID = None
+        self.dropFromSatID = None
+        self.dropBufferUsedBits = None
+        self.dropBufferCapacityBits = None
+        self.dropBufferUtilization = None
+        self.dropReward = None
+        self.dropFeedbackStored = False
         self.isNewPath = False
         self.oldPath = []
         self.newPath = []
@@ -1331,6 +1629,7 @@ class DataBlock:
         self.queueTime= []
         self.oldState  = None
         self.oldAction = None
+        self.oldAgentSatID = None
         # self.oldReward = None
 
     def getQueueTime(self):
@@ -1340,8 +1639,10 @@ class DataBlock:
         Rest of the steps: sum(checkpoint (Arrival time at node) - checkpointsSend (send time at previous node))
         '''
         queueLatency = [0, []]
-        queueLatency[0] += self.timeAtFirstTransmission - self.creationTime        # ANCHOR queue first step
-        queueLatency[1].append(self.timeAtFirstTransmission - self.creationTime)
+        if self.timeAtFirstTransmission is not None and self.timeAtFull is not None:
+            first_queue_time = self.timeAtFirstTransmission - self.timeAtFull
+            queueLatency[0] += first_queue_time
+            queueLatency[1].append(first_queue_time)
         for arrived, sendReady in zip(self.checkPoints, self.checkPointsSend):  # rest of the steps
             queueLatency[0] += sendReady - arrived
             queueLatency[1].append(sendReady - arrived)
@@ -1350,17 +1651,17 @@ class DataBlock:
         return queueLatency
 
     def getTotalTransmissionTime(self):
-        totalTime = 0
-        if len(self.checkPoints) == 1:
-            return self.checkPoints[0] - self.timeAtFirstTransmission
+        if not self.delivered or self.timeAtFull is None or self.terminalTime is None:
+            return None
 
-        lastTime = self.creationTime
-        for time in self.checkPoints:
-            totalTime += time - lastTime
-            lastTime = time
-        # ANCHOR KPI: totLatency
-        self.totLatency = totalTime
-        return totalTime
+        self.totLatency = self.terminalTime - self.timeAtFull
+        return self.totLatency
+
+    @property
+    def fillTime(self):
+        if self.timeAtFull is None:
+            return None
+        return self.timeAtFull - self.creationTime
 
     def __repr__(self):
         return'ID = {}\n Source:\n {}\n Destination:\n {}\nTotal latency: {}'.format(
@@ -1441,6 +1742,25 @@ class Gateway:
                 # add a process for each destination which runs the function 'fillBlock'
                 self.fillBlocks.append(self.env.process(self.fillBlock(gt)))
 
+    def enqueueFullBlock(self, block):
+        """Prepare the current route and enqueue a block that is already full."""
+        block.path = self.paths[block.destination.name]
+        if not block.path:
+            raise RuntimeError(
+                f'No path from {self.name} to {block.destination.name} for block {block.ID}'
+            )
+
+        if self.earth.pathParam in RL_PATHINGS:
+            block.QPath = [block.path[0], block.path[1], block.path[-1]]
+
+        if not self.sendBuffer[0][0].triggered:
+            self.sendBuffer[0][0].succeed()
+            self.sendBuffer[1].append(block)
+        else:
+            self.sendBuffer[0].append(self.env.event().succeed())
+            self.sendBuffer[1].append(block)
+        block.status = 'queued'
+
     def fillBlock(self, destination):
         """
         Simpy process function:
@@ -1462,41 +1782,19 @@ class Gateway:
 
                 yield self.env.timeout(timeToFull)  # wait until block is full
 
+                # Network latency starts here; gateway filling time is kept separately.
+                block.timeAtFull = self.env.now
+                block.status = 'ready'
+                createdBlocks.append(block)
+                index += 1
+
                 if block.destination.linkedSat[0] is None:
                     unavailableDestinationBuffer.append(block)
                 else:
                     while unavailableDestinationBuffer: # empty buffer before adding new block
-                        if not self.sendBuffer[0][0].triggered:
-                            self.sendBuffer[0][0].succeed()
-                            self.sendBuffer[1].append(unavailableDestinationBuffer[0])
-                            unavailableDestinationBuffer.pop(0)
-                        else:
-                            newEvent = self.env.event().succeed()
-                            self.sendBuffer[0].append(newEvent)
-                            self.sendBuffer[1].append(unavailableDestinationBuffer[0])
-                            unavailableDestinationBuffer.pop(0)
+                        self.enqueueFullBlock(unavailableDestinationBuffer.pop(0))
 
-                    block.path = self.paths[destination.name]
-
-                    if self.earth.pathParam == 'Q-Learning' or self.earth.pathParam == 'Deep Q-Learning' or self.earth.pathParam == 'GAT-DQN':
-                        block.QPath = [block.path[0], block.path[1], block.path[len(block.path)-1]]
-                        # We add a Qpath field for the Q-Learning case. Only source and destination will be added
-                        # after that, every hop will be added at the second last position.
-
-                    if not block.path:
-                        print(self.name, destination.name)
-                        exit()
-                    block.timeAtFull = self.env.now
-                    createdBlocks.append(block)
-                    # add block to send-buffer
-                    if not self.sendBuffer[0][0].triggered:
-                        self.sendBuffer[0][0].succeed()
-                        self.sendBuffer[1].append(block)
-                    else:
-                        newEvent = self.env.event().succeed()
-                        self.sendBuffer[0].append(newEvent)
-                        self.sendBuffer[1].append(block)
-                    index += 1
+                    self.enqueueFullBlock(block)
             except simpy.Interrupt:
                 print(f'Simpy interrupt at filling block at gateway{self.name}')
                 break
@@ -1521,6 +1819,8 @@ class Gateway:
         """
         while True:
             yield self.sendBuffer[0][0]     # event 0 of block 0
+            block = self.sendBuffer[1][0]
+            block.status = 'transmitting'
 
             # wait until a satellite is linked
             while self.linkedSat[0] is None:
@@ -1530,16 +1830,17 @@ class Gateway:
             propTime = self.timeToSend(self.linkedSat)
             timeToSend = BLOCK_SIZE/self.dataRate
 
-            self.sendBuffer[1][0].timeAtFirstTransmission = self.env.now
+            block.timeAtFirstTransmission = self.env.now
             yield self.env.timeout(timeToSend)
             # ANCHOR KPI: txLatency send block from GT
-            self.sendBuffer[1][0].txLatency += timeToSend
+            block.txLatency += timeToSend
 
-            if not self.sendBuffer[1][0].path:
-                print(self.sendBuffer[1][0].source.name, self.sendBuffer[1][0].destination.name)
+            if not block.path:
+                print(block.source.name, block.destination.name)
                 exit()
 
-            self.linkedSat[1].createReceiveBlockProcess(self.sendBuffer[1][0], propTime)
+            block.status = 'in_flight'
+            self.linkedSat[1].createReceiveBlockProcess(block, propTime)
 
             # remove from own sendBuffer
             if len(self.sendBuffer[0]) == 1:
@@ -1577,10 +1878,20 @@ class Gateway:
         """
         # wait for block to fully propagate
         yield self.env.timeout(propTime)
+        if block.status in ('delivered', 'dropped'):
+            return
         # ANCHOR KPI: propLatency send block from GT
         block.propLatency += propTime
 
         block.checkPoints.append(self.env.now)
+
+        block.delivered = True
+        block.dropped = False
+        block.status = 'delivered'
+        block.terminalTime = self.env.now
+        if block.timeAtFull is not None:
+            block.timeInNetwork = block.terminalTime - block.timeAtFull
+            block.totLatency = block.timeInNetwork
 
         receivedDataBlocks.append(block)
 
@@ -1917,6 +2228,8 @@ class Gateway:
                 self.totalAvgFlow = capacity * fraction
                 
         print(self.name + ': ' + str(self.totalAvgFlow/1000000000))
+        flow_per_dest = self.totalAvgFlow / 2
+        print(self.name + ' flow per destination: ' + str(flow_per_dest / 1000000) + ' Mbps')
 
     def __eq__(self, other):
         if self.latitude == other.latitude and self.longitude == other.longitude:
@@ -2001,9 +2314,21 @@ class Earth:
     def __init__(self, env, img_path, gt_path, constellation, inputParams, deltaT, totalLocations, getRates = False, window=None, outputPath='/'):
         # Input the population count data
         # img_path = 'Population Map/gpw_v4_population_count_rev11_2020_15_min.tif'
+        self.env = env
         self.outputPath = outputPath
         self.plotPaths = plotPath
         self.lostBlocks = 0
+        self.droppedDataBlocks = []
+        self.droppedBlockIDs = set()
+        self.blockDropRecords = []
+        self.dropCounts = {
+            'buffer_overflow': 0,
+            'block_too_large': 0,
+            'no_route': 0,
+            'link_failure': 0,
+            'invalid_path': 0
+        }
+        self.dropBits = {reason: 0 for reason in self.dropCounts}
         self.queues = []
         self.loss   = []
         self.lossAv = []
@@ -2096,6 +2421,153 @@ class Earth:
 
         # Simpy process for handling moving the constellation and the satellites within the constellation
         self.moveConstellation = env.process(self.moveConstellation(env, deltaT, getRates))
+
+    def registerBlockDrop(self, block, reason, drop_sat, release_buffer=False):
+        """Idempotently terminate and record a dropped block."""
+        if block.ID in self.droppedBlockIDs or block.status == 'delivered':
+            return None
+
+        used_before_release = drop_sat.buffer_used_bits
+        capacity_bits = drop_sat.buffer_capacity_bits
+        utilization = (
+            used_before_release / capacity_bits if capacity_bits > 0 else 1.0
+        )
+
+        if release_buffer and not drop_sat.releaseBlock(block):
+            raise RuntimeError(
+                f'Dropped resident block {block.ID} was not accounted at satellite {drop_sat.ID}'
+            )
+
+        block.status = 'dropped'
+        block.delivered = False
+        block.dropped = True
+        block.dropReason = reason
+        block.dropTime = self.env.now
+        block.terminalTime = self.env.now
+        block.dropSatID = drop_sat.ID
+        block.dropFromSatID = block.oldAgentSatID
+        block.dropBufferUsedBits = used_before_release
+        block.dropBufferCapacityBits = capacity_bits
+        block.dropBufferUtilization = utilization
+        block.totLatency = None
+        if block.timeAtFull is not None:
+            block.timeInNetwork = block.terminalTime - block.timeAtFull
+
+        self.droppedBlockIDs.add(block.ID)
+        self.droppedDataBlocks.append(block)
+        self.lostBlocks += 1
+        self.dropCounts.setdefault(reason, 0)
+        self.dropBits.setdefault(reason, 0)
+        self.dropCounts[reason] += 1
+        self.dropBits[reason] += block.size
+
+        action_direction = None
+        if (
+            isinstance(block.oldAction, (int, np.integer))
+            and 0 <= block.oldAction < len(GAT_ACTIONS)
+        ):
+            action_direction = GAT_ACTIONS[int(block.oldAction)]
+
+        route = block.QPath if block.QPath else block.path
+        if isinstance(route, (list, tuple)):
+            route_string = '->'.join(str(step[0]) for step in route)
+        elif route:
+            route_string = str(route)
+        else:
+            route_string = ''
+        record = {
+            'simulation_time': self.env.now,
+            'block_id': block.ID,
+            'source_gt': block.source.ID,
+            'destination_gt': block.destination.ID,
+            'block_size_bits': block.size,
+            'status': block.status,
+            'delivered': block.delivered,
+            'drop_reason': reason,
+            'drop_sat_id': drop_sat.ID,
+            'from_sat_id': block.oldAgentSatID,
+            'time_at_full': block.timeAtFull,
+            'drop_time': block.dropTime,
+            'time_in_network': block.timeInNetwork,
+            'buffer_used_bits': used_before_release,
+            'buffer_capacity_bits': capacity_bits,
+            'buffer_utilization': utilization,
+            'old_agent_sat_id': block.oldAgentSatID,
+            'old_action': block.oldAction,
+            'old_action_direction': action_direction,
+            'hop_count': max(0, len(block.QPath) - 2),
+            'route': route_string,
+            'drop_reward': None,
+            'rl_feedback_stored': False
+        }
+        self.blockDropRecords.append(record)
+        return record
+
+    def resolveDecisionAgent(self, block):
+        decision_sat = (
+            findByID(self, block.oldAgentSatID)
+            if block.oldAgentSatID is not None else None
+        )
+        if self.DDQNA is not None:
+            return self.DDQNA, decision_sat
+        if decision_sat is None:
+            return None, None
+        return decision_sat.DDQNA, decision_sat
+
+    def applyDropRLFeedback(self, block, drop_record):
+        """Store one terminal transition for the satellite action that caused a drop."""
+        if drop_record is None or block.dropFeedbackStored:
+            return False
+        if block.dropReason not in ('buffer_overflow', 'block_too_large'):
+            return False
+        if block.oldState is None or block.oldAction is None:
+            return False
+
+        agent, decision_sat = self.resolveDecisionAgent(block)
+        if agent is None or not hasattr(agent, 'experienceReplay'):
+            return False
+
+        agent.experienceReplay.store(
+            block.oldState,
+            block.oldAction,
+            BUFFER_OVERFLOW_REWARD,
+            block.oldState,
+            True
+        )
+        block.dropReward = BUFFER_OVERFLOW_REWARD
+        block.dropFeedbackStored = True
+        self.rewards.append([BUFFER_OVERFLOW_REWARD, self.env.now])
+        drop_record['drop_reward'] = BUFFER_OVERFLOW_REWARD
+        drop_record['rl_feedback_stored'] = True
+
+        agent.transitionCount += 1
+        if TrainThis and agent.transitionCount % nTrain == 0:
+            log_sat = decision_sat or findByID(self, block.dropSatID)
+            if log_sat is not None:
+                agent.train(log_sat, self)
+        return True
+
+    def saveBlockDropRecords(self, output_path):
+        os.makedirs(output_path, exist_ok=True)
+        pd.DataFrame(self.blockDropRecords).to_csv(
+            os.path.join(output_path, 'block_drops.csv'),
+            index=False
+        )
+        summary = []
+        created_count = len(createdBlocks)
+        for reason, count in self.dropCounts.items():
+            summary.append({
+                'reason': reason,
+                'count': count,
+                'dropped_bits': self.dropBits.get(reason, 0),
+                'percentage_of_created': (
+                    count / created_count * 100 if created_count else 0.0
+                )
+            })
+        pd.DataFrame(summary).to_csv(
+            os.path.join(output_path, 'drop_summary.csv'),
+            index=False
+        )
 
     def set_window(self, window):  # function to change/set window for the earth
         """
@@ -2342,7 +2814,9 @@ class Earth:
                     sat.sendBlocksSatsInter.append(sat.env.process(sat.sendBlock(neighbor, True, False)))
 
                 # sort blocks by arrival time at satellite
-                blocksToDistribute.sort()
+                blocksToDistribute.sort(
+                    key=lambda item: (item[0], item[1].ID)
+                )
                 # add blocks to the correct queues based on next step in their path
                 # since the blocks list is sorted by arrival time, the order in the new queues is correct
                 for block in blocksToDistribute:
@@ -2353,15 +2827,15 @@ class Earth:
                             index = i
 
                     # check if next step in path is GT (last step in path)
-                    if index == len(block[1].path) - 2:
+                    if index is None:
+                        self.registerBlockDrop(
+                            block[1], 'invalid_path', sat, release_buffer=True
+                        )
+                    elif index == len(block[1].path) - 2:
                         # add block to GT send-buffer
-                        if not sat.sendBufferGT[0][0].triggered:
-                            sat.sendBufferGT[0][0].succeed()
-                            sat.sendBufferGT[1].append(block[1])
-                        else:
-                            newEvent = sat.env.event().succeed()
-                            sat.sendBufferGT[0].append(newEvent)
-                            sat.sendBufferGT[1].append(block[1])
+                        sat.enqueueAdmittedBlock(
+                            sat.sendBufferGT, block[1]
+                        )
                     else:
                         # get ID of next sat and find if it is intra or inter
                         ID = None
@@ -2389,15 +2863,16 @@ class Earth:
                                         sendBuffer = buffer
 
                             # add block to buffer
-                            if not sendBuffer[0][0].triggered:
-                                sendBuffer[0][0].succeed()
-                                sendBuffer[1].append(block[1])
-                            else:
-                                newEvent = sat.env.event().succeed()
-                                sendBuffer[0].append(newEvent)
-                                sendBuffer[1].append(block[1])
+                            sat.enqueueAdmittedBlock(
+                                sendBuffer, block[1]
+                            )
                         else:
                             print("buffer for next satellite in path could not be found")
+                            self.registerBlockDrop(
+                                block[1], 'no_route', sat, release_buffer=True
+                            )
+
+                sat.assertBufferAccounting()
 
     def updateSatelliteProcessesCorrect(self, graph):
         """
@@ -2419,8 +2894,8 @@ class Earth:
             - All blocks not currently being transmitted to a satellite/GT, which is still present as a ISL or GSL, are
             redistributed to send-buffers according to their arrival time at the satellite.
 
-        This function differentiates from the simple version by allowing continued operation of send-processes after
-        constellation movement if the link is not broken.
+        Inter-plane send processes are restarted on every topology update so
+        that no live process retains a stale queue or stale link rate.
         """
         sats = []
         for plane in self.LEO:
@@ -2577,84 +3052,9 @@ class Earth:
 
                 ### inter-plane ISLs ###
 
-                sat.newBuffer = [True for _ in range(len(neighborSatsInter))]
-
-                # make a list of False entries for each current neighbor
-                sameSats = [False for _ in range(len(neighborSatsInter))]
-
-                buffers = [None for _ in range(len(neighborSatsInter))]
-                processes = [None for _ in range(len(neighborSatsInter))]
-
-                # go through each process/buffer
-                #   - check if the satellite is still there:
-                #       - if it is, change the corresponding False to True, handle blocks and add process and buffer references to temporary list
-                #       - if it is not, remove blocks from buffer and stop process
-                for bufferIndex, buffer in enumerate(sat.sendBufferSatsInter):
-                    # check if the satellite is still there
-                    isPresent = False
-                    for neighborIndex, neighbor in enumerate(neighborSatsInter):
-                        if buffer[2] == neighbor[1].ID:
-                            isPresent = True
-                            sameSats[neighborIndex] = True
-
-                            ## handle blocks
-                            # check if there are blocks in the buffer
-                            if buffer[1]:
-                                # find index of satellite in block's path
-                                index = None
-                                for i, step in enumerate(buffer[1][0].path):
-                                    if sat.ID == step[0]:
-                                        index = i
-                                        break
-
-                                # check if next step in path corresponds to buffer's satellite
-                                if buffer[1][0].path[index + 1][0] == buffer[2]:
-                                    # add all but the first block to redistribution list
-                                    for block in buffer[1][1:]:
-                                        blocksToDistribute.append((block.checkPoints[-1], block))
-
-                                    # add buffer with only first block present to temp list
-                                    buffers[neighborIndex] = ([sat.env.event().succeed()], [sat.sendBufferSatsInter[bufferIndex][1][0]], buffer[2])
-                                    processes[neighborIndex] = sat.sendBlocksSatsInter[bufferIndex]
-                                else:
-                                    # add all blocks to redistribution list
-                                    for block in buffer[1]:
-                                        blocksToDistribute.append((block.checkPoints[-1], block))
-                                    # reset buffer
-                                    buffers[neighborIndex] = ([sat.env.event()], [], buffer[2])
-
-                                    # reset process
-                                    sat.sendBlocksSatsInter[bufferIndex].interrupt()
-                                    processes[neighborIndex] = sat.env.process(sat.sendBlock(neighbor, True, False))
-
-                            else: # there are no blocks in the buffer
-                                # add buffer and remake process
-                                buffers[neighborIndex] = sat.sendBufferSatsInter[bufferIndex]
-                                sat.sendBlocksSatsInter[bufferIndex].interrupt()
-                                processes[neighborIndex] = sat.env.process(sat.sendBlock(neighbor, True, False))
-                                # sendBlocksSatsInter[bufferIndex]
-
-                            break
-                    if not isPresent:
-                        # add blocks to redistribution list
-                        for block in buffer[1]:
-                            blocksToDistribute.append((block.checkPoints[-1], block))
-                        # stop process
-                        sat.sendBlocksSatsInter[bufferIndex].interrupt()
-
-                # make buffer and process for new neighbors(s)
-                # - go through list of previously false entries:
-                #   - check  entry for each neighbor:
-                #       - if False, create buffer and process for new neighbor
-                # - clear temporary list of processes and buffers
-                for entryIndex, entry in enumerate(sameSats):
-                    if not entry:
-                        buffers[entryIndex] = ([sat.env.event()], [], neighborSatsInter[entryIndex][1].ID)
-                        processes[entryIndex] = sat.env.process(sat.sendBlock(neighborSatsInter[entryIndex], True, False))
-
-                # overwrite buffers and processes
-                sat.sendBlocksSatsInter = processes
-                sat.sendBufferSatsInter = buffers
+                blocksToDistribute.extend(
+                    sat.rebuildInterSatelliteBuffers(neighborSatsInter)
+                )
 
                 ### intra-plane ISLs ###
                 # check blocks for each buffer
@@ -2754,7 +3154,9 @@ class Earth:
                         sat.sendBufferGT = ([sat.env.event()], [])
 
                 # sort blocks by arrival time at satellite
-                blocksToDistribute.sort()
+                blocksToDistribute.sort(
+                    key=lambda item: (item[0], item[1].ID)
+                )
                 # add blocks to the correct queues based on next step in their path
                 # since the blocks list is sorted by arrival time, the order in the new queues is correct
                 for block in blocksToDistribute:
@@ -2765,15 +3167,15 @@ class Earth:
                             index = i
 
                     # check if next step in path is GT (last step in path)
-                    if index == len(block[1].path) - 2:
+                    if index is None:
+                        self.registerBlockDrop(
+                            block[1], 'invalid_path', sat, release_buffer=True
+                        )
+                    elif index == len(block[1].path) - 2:
                         # add block to GT send-buffer
-                        if not sat.sendBufferGT[0][0].triggered:
-                            sat.sendBufferGT[0][0].succeed()
-                            sat.sendBufferGT[1].append(block[1])
-                        else:
-                            newEvent = sat.env.event().succeed()
-                            sat.sendBufferGT[0].append(newEvent)
-                            sat.sendBufferGT[1].append(block[1])
+                        sat.enqueueAdmittedBlock(
+                            sat.sendBufferGT, block[1]
+                        )
                     else:
                         # get ID of next sat and find if it is intra or inter
                         ID = None
@@ -2801,23 +3203,19 @@ class Earth:
                                         sendBuffer = buffer
 
                             # add block to buffer
-                            if not sendBuffer[0][0].triggered:
-                                sendBuffer[0][0].succeed()
-                                sendBuffer[1].append(block[1])
-                            else:
-                                newEvent = sat.env.event().succeed()
-                                sendBuffer[0].append(newEvent)
-                                sendBuffer[1].append(block[1])
+                            sat.enqueueAdmittedBlock(
+                                sendBuffer, block[1]
+                            )
                         else:
                             print("buffer for next satellite in path could not be found")
+                            self.registerBlockDrop(
+                                block[1], 'no_route', sat, release_buffer=True
+                            )
+
+                sat.assertBufferAccounting()
 
     def updateSatelliteProcessesRL(self, graph):
         """
-        Update: This function works now. The issue is that all the inter-plane packets that were in a queue to be sent are discarded
-        when the graph is updated and those links stop existing.
-        This function does not work correctly! The remaking of processes and queues fails when the satellites move
-        enough so that new links must be formed.
-
         This function takes into account that the paths are not complete and the next step may not have been chosen yet.
 
         Function which ensures all processes on all satellites are updated after constellation movement. This is done in
@@ -2833,8 +3231,8 @@ class Earth:
             - All blocks not currently being transmitted to a satellite/GT, which is still present as a ISL or GSL, are
             redistributed to send-buffers according to their arrival time at the satellite.
 
-        This function differentiates from the simple version by allowing continued operation of send-processes after
-        constellation movement if the link is not broken.
+        Inter-plane send processes are restarted on every topology update so
+        that no live process retains a stale queue or stale link rate.
         """
         # update linked sats
         sats = []
@@ -3076,84 +3474,9 @@ class Earth:
 
                 ### inter-plane ISLs ###
 
-                sat.newBuffer = [True for _ in range(len(neighborSatsInter))]
-
-                # make a list of False entries for each current neighbor
-                sameSats = [False for _ in range(len(neighborSatsInter))]
-
-                buffers = [None for _ in range(len(neighborSatsInter))]
-                processes = [None for _ in range(len(neighborSatsInter))]
-
-                # go through each process/buffer
-                #   - check if the satellite is still there:
-                #       - if it is, change the corresponding False to True, handle blocks and add process and buffer references to temporary list
-                #       - if it is not, remove blocks from buffer and stop process
-                for bufferIndex, buffer in enumerate(sat.sendBufferSatsInter):
-                    # check if the satellite is still there
-                    isPresent = False
-                    for neighborIndex, neighbor in enumerate(neighborSatsInter):
-                        if buffer[2] == neighbor[1].ID:
-                            isPresent = True
-                            sameSats[neighborIndex] = True
-
-                            ## handle blocks
-                            # check if there are blocks in the buffer
-                            if buffer[1]:
-                                # find index of satellite in block's path
-                                index = None
-                                for i, step in enumerate(buffer[1][0].QPath):
-                                    if sat.ID == step[0]:
-                                        index = i
-                                        break
-
-                                # check if next step in path corresponds to buffer's satellite
-                                if buffer[1][0].QPath[index + 1][0] == buffer[2]:
-                                    # add all but the first block to redistribution list
-                                    for block in buffer[1][1:]:
-                                        blocksToDistribute.append((block.checkPoints[-1], block))
-
-                                    # add buffer with only first block present to temp list
-                                    buffers[neighborIndex] = ([sat.env.event().succeed()], [sat.sendBufferSatsInter[bufferIndex][1][0]], buffer[2])
-                                    processes[neighborIndex] = sat.sendBlocksSatsInter[bufferIndex]
-                                else:
-                                    # add all blocks to redistribution list
-                                    for block in buffer[1]:
-                                        blocksToDistribute.append((block.checkPoints[-1], block))
-                                    # reset buffer
-                                    buffers[neighborIndex] = ([sat.env.event()], [], buffer[2])
-
-                                    # reset process
-                                    sat.sendBlocksSatsInter[bufferIndex].interrupt()
-                                    processes[neighborIndex] = sat.env.process(sat.sendBlock(neighbor, True, False))
-
-                            else: # there are no blocks in the buffer
-                                # add buffer and remake process
-                                buffers[neighborIndex] = sat.sendBufferSatsInter[bufferIndex]
-                                sat.sendBlocksSatsInter[bufferIndex].interrupt()
-                                processes[neighborIndex] = sat.env.process(sat.sendBlock(neighbor, True, False))
-                                # sendBlocksSatsInter[bufferIndex]
-
-                            break
-                    if not isPresent:
-                        # add blocks to redistribution list
-                        for block in buffer[1]:
-                            blocksToDistribute.append((block.checkPoints[-1], block))
-                        # stop process
-                        sat.sendBlocksSatsInter[bufferIndex].interrupt()
-
-                # make buffer and process for new neighbors(s)
-                # - go through list of previously false entries:
-                #   - check  entry for each neighbor:
-                #       - if False, create buffer and process for new neighbor
-                # - clear temporary list of processes and buffers
-                for entryIndex, entry in enumerate(sameSats):
-                    if not entry:
-                        buffers[entryIndex] = ([sat.env.event()], [], neighborSatsInter[entryIndex][1].ID)
-                        processes[entryIndex] = sat.env.process(sat.sendBlock(neighborSatsInter[entryIndex], True, False))
-
-                # overwrite buffers and processes
-                sat.sendBlocksSatsInter = processes
-                sat.sendBufferSatsInter = buffers
+                blocksToDistribute.extend(
+                    sat.rebuildInterSatelliteBuffers(neighborSatsInter)
+                )
 
                 ### intra-plane ISLs ###
                 # check blocks for each buffer
@@ -3253,11 +3576,9 @@ class Earth:
                         sat.sendBufferGT = ([sat.env.event()], [])
 
                 # sort blocks by arrival time at satellite
-                try:
-                    blocksToDistribute.sort()
-                except Exception as e:
-                    print(f"Caught an exception: {e}")
-                    print(f'Something wrong with: \n{blocksToDistribute}')
+                blocksToDistribute.sort(
+                    key=lambda item: (item[0], item[1].ID)
+                )
                 # add blocks to the correct queues based on next step in their path
                 # since the blocks list is sorted by arrival time, the order in the new queues is correct
                 for block in blocksToDistribute:
@@ -3270,16 +3591,12 @@ class Earth:
                     # check if next step in path is GT (last step in path)
                     if index is None:
                         print(f'Satellite {sat.ID} not found in the QPath: {block[1].QPath}') # FIXME This should not happen. Debugging I realized when this happens the previous satellite is twice in last positions of QPath, instead of prevSat and currentSat. The current sat was the linked to the gateways bu after the movement it is not anymore.
-                        self.lostBlocks += 1
+                        self.registerBlockDrop(
+                            block[1], 'invalid_path', sat, release_buffer=True
+                        )
                     elif index == len(block[1].QPath) - 2:
                         # add block to GT send-buffer
-                        if not sat.sendBufferGT[0][0].triggered:
-                            sat.sendBufferGT[0][0].succeed()
-                            sat.sendBufferGT[1].append(block[1])
-                        else:
-                            newEvent = sat.env.event().succeed()
-                            sat.sendBufferGT[0].append(newEvent)
-                            sat.sendBufferGT[1].append(block[1])
+                        sat.enqueueAdmittedBlock(sat.sendBufferGT, block[1])
                     else:
                         # get ID of next sat and find if it is intra or inter
                         ID = None
@@ -3307,15 +3624,14 @@ class Earth:
                                         sendBuffer = buffer
 
                             # add block to buffer
-                            if not sendBuffer[0][0].triggered:
-                                sendBuffer[0][0].succeed()
-                                sendBuffer[1].append(block[1])
-                            else:
-                                newEvent = sat.env.event().succeed()
-                                sendBuffer[0].append(newEvent)
-                                sendBuffer[1].append(block[1])
+                            sat.enqueueAdmittedBlock(sendBuffer, block[1])
                         else:
                             print("buffer for next satellite in path could not be found")
+                            self.registerBlockDrop(
+                                block[1], 'no_route', sat, release_buffer=True
+                            )
+
+                sat.assertBufferAccounting()
 
     def updateGTPaths(self):
         """
@@ -4016,6 +4332,7 @@ class DDQNAgent:
 
         self.step   = 0
         self.i      = 0
+        self.transitionCount = 0
 
         self.replayBuffer  = []
         self.experienceReplay = ExperienceReplay(self.bufferS)
@@ -4041,6 +4358,9 @@ class DDQNAgent:
                 print(f'Satellite {sat_ID} Q-Network initialized')
             if ddqn:
                 self.qTarget  = self.createModel()
+                # Both networks are created independently, so explicitly start
+                # the target network from the online network's weights.
+                self.qTarget.set_weights(self.qNetwork.get_weights())
                 if sat_ID is None:
                     print('----------------------------------')
                     print("DDQN enabled, TARGET NETWORK created:")
@@ -4090,7 +4410,8 @@ class DDQNAgent:
             while(linkedSats[action] == None):   # if that direction has no linked satellite
                 self.experienceReplay.store(newState, actIndex, unavPenalty, newState, False) # stores experience, repeats randomly
                 self.earth.rewards.append([unavPenalty, sat.env.now])
-                action = self.actions[random.randrange(len(self.actions))]
+                actIndex = random.randrange(self.actionSize)
+                action = self.actions[actIndex]
 
         # highest value (Exploitation)
         else:
@@ -4285,6 +4606,7 @@ class DDQNAgent:
         # this will be saved always, except when the next hop is the destination, where the process will have already returned
         block.oldState  = newState
         block.oldAction = actIndex
+        block.oldAgentSatID = sat.ID
         
         return nextHop
 
@@ -4350,15 +4672,28 @@ class DDQNAgent:
         states      = states.reshape((self.batchS,self.stateSize))
         nextStates  = nextStates.reshape((self.batchS,self.stateSize))
          
-        # 2. Compute expected reward
-        if ddqn:
-            futureRewards = self.qTarget(nextStates)           # NOTE NN. Gets future rewards
-        else:
-            futureRewards = self.qNetwork(nextStates)          # NOTE NN. Gets future rewards
-        expectedRewards = rewards + self.gamma*np.max(futureRewards, axis=1)
+        actions = np.asarray(actions, dtype=np.int32)
+        rewards = np.asarray(rewards, dtype=np.float32)
+        dones = np.asarray(Dones, dtype=np.float32)
 
-        # 3. Mask for the actions
-        acts = np.eye(self.actionSize)[actions]
+        # 2. Compute the bootstrapped value. In Double DQN, the online
+        # network selects the action and the target network evaluates it.
+        if ddqn:
+            nextOnlineQ = self.qNetwork(nextStates, training=False).numpy()
+            nextActions = np.argmax(nextOnlineQ, axis=1)
+            nextTargetQ = self.qTarget(nextStates, training=False).numpy()
+            futureRewards = nextTargetQ[np.arange(self.batchS), nextActions]
+        else:
+            nextQ = self.qNetwork(nextStates, training=False).numpy()
+            futureRewards = np.max(nextQ, axis=1)
+
+        # Terminal transitions must not bootstrap from the next state.
+        expectedRewards = rewards + self.gamma * (1.0 - dones) * futureRewards
+
+        # 3. Preserve Q-values for actions that were not selected and replace
+        # only the target corresponding to the sampled action.
+        targetQ = self.qNetwork(states, training=False).numpy()
+        targetQ[np.arange(self.batchS), actions] = expectedRewards
 
         # 4. Stop Loss
         if stopLoss and len(sat.orbPlane.earth.loss)>nLosses:
@@ -4377,7 +4712,7 @@ class DDQNAgent:
                 return 0
 
         # 5. fit the model and save the loss
-        loss = self.qNetwork.fit(states, acts * expectedRewards[:, None], batch_size=self.batchS, epochs=1, verbose=0) # NOTE qNetwork fit
+        loss = self.qNetwork.fit(states, targetQ, batch_size=self.batchS, epochs=1, verbose=0) # NOTE qNetwork fit
         sat.orbPlane.earth.loss.append([loss.history['loss'][0], sat.env.now])
         earth.trains.append([sat.env.now]) # counts the number of trainings
 
@@ -4601,6 +4936,7 @@ class GATDQNAgent:
 
         self.step = 0
         self.i = 0
+        self.transitionCount = 0
         self.epsilon = []
 
         self.experienceReplay = ExperienceReplay(self.bufferS)
@@ -4815,8 +5151,7 @@ class GATDQNAgent:
         )
 
         if graph_state is None:
-            earth.lostBlocks += 1
-            return 0
+            return -1
 
         self.step += 1
 
@@ -4824,18 +5159,20 @@ class GATDQNAgent:
         if sat.linkedGT and block.destination.ID == sat.linkedGT.ID:
             if prevSat is not None and getattr(block, 'oldState', None) is not None:
                 reward = self._arrival_reward(block, prevSat, sat)
-
-                self.experienceReplay.store(
+                transition_agent, decision_sat = earth.resolveDecisionAgent(block)
+                transition_agent = transition_agent or self
+                transition_agent.experienceReplay.store(
                     block.oldState,
                     block.oldAction,
                     reward,
                     graph_state,
                     True
                 )
+                transition_agent.transitionCount += 1
                 earth.rewards.append([reward, sat.env.now])
 
-                if TrainThis:
-                    self.train(sat, earth)
+                if TrainThis and transition_agent.transitionCount % nTrain == 0:
+                    transition_agent.train(decision_sat or sat, earth)
 
             return 0
 
@@ -4847,7 +5184,6 @@ class GATDQNAgent:
         )
 
         if action_index < 0:
-            earth.lostBlocks += 1
             return -1
 
         # 当前卫星接收了上一跳的数据，因此可写入上一跳转移。
@@ -4860,21 +5196,25 @@ class GATDQNAgent:
                 earth
             )
 
-            self.experienceReplay.store(
+            transition_agent, decision_sat = earth.resolveDecisionAgent(block)
+            transition_agent = transition_agent or self
+            transition_agent.experienceReplay.store(
                 block.oldState,
                 block.oldAction,
                 reward,
                 graph_state,
                 False
             )
+            transition_agent.transitionCount += 1
             earth.rewards.append([reward, sat.env.now])
 
-            if TrainThis and self.step % nTrain == 0:
-                self.train(sat, earth)
+            if TrainThis and transition_agent.transitionCount % nTrain == 0:
+                transition_agent.train(decision_sat or sat, earth)
 
         # 为当前动作保存图状态。
         block.oldState = graph_state
         block.oldAction = action_index
+        block.oldAgentSatID = sat.ID
 
         self.alignQTarget()
         return nextHop
@@ -4922,15 +5262,28 @@ class GATDQNAgent:
         next_model_inputs, next_action_mask = pack_gat_states(next_states)
 
         # 保留现有“Q 网络 + target 网络”的 target 计算框架。
-        future_q = self.qTarget(next_model_inputs, training=False)
-        future_q = self._masked_q_values(future_q, next_action_mask)
+        # Double DQN: online network selects; target network evaluates.
+        next_online_q = self.qNetwork(next_model_inputs, training=False)
+        next_online_q = self._masked_q_values(next_online_q, next_action_mask)
+        next_actions = tf.argmax(
+            next_online_q,
+            axis=1,
+            output_type=tf.int32
+        )
+
+        next_target_q = self.qTarget(next_model_inputs, training=False)
+        future_value = tf.gather(
+            next_target_q,
+            next_actions,
+            axis=1,
+            batch_dims=1
+        )
 
         has_next_action = tf.reduce_any(
             tf.cast(next_action_mask, tf.bool),
             axis=1
         )
 
-        future_value = tf.reduce_max(future_q, axis=1)
         future_value = tf.where(
             has_next_action,
             future_value,
@@ -6267,14 +6620,7 @@ def _normalised_queue_features(sat):
     输出卫星自身 U/D/R/L 四个发送队列。
     getDeepSatScore 后范围为 [0, queueVals]，这里归一化至 [0, 1]。
     """
-    queues = getQueues(sat, DDQN=True)
-
-    return [
-        getDeepSatScore(queues['U']) / float(queueVals),
-        getDeepSatScore(queues['D']) / float(queueVals),
-        getDeepSatScore(queues['R']) / float(queueVals),
-        getDeepSatScore(queues['L']) / float(queueVals)
-    ]
+    return sat.directionalBufferRatios()
 
 
 def _live_directional_neighbours(sat, graph, earth):
@@ -6441,7 +6787,7 @@ def build_gat_k_hop_state(block, root_sat, graph, earth, k_hops):
     assert adjacency.shape == (num_nodes, num_nodes)
 
     return {
-        'x': node_features,                 # [N_k, 13]
+        'x': node_features,                 # [N_k, 14]
         'adj': adjacency,                   # [N_k, N_k]
         'node_ids': tuple(sat.ID for sat in nodes),
         'action_nodes': action_nodes,       # [4]
@@ -7213,20 +7559,23 @@ def plot_packet_latencies_and_uplink_downlink_throughput(data, outputPath, bins_
     # Group blocks by (source, destination) paths
     paths_data = defaultdict(list)
     for block in data:
+        if not block.delivered or block.totLatency is None or not block.path:
+            continue
         src = block.path[0][0]        # Source
         dst = block.path[-1][0]       # Destination
         paths_data[(src, dst)].append(block)
 
     # Function to plot data for a single path or combined
     def plot_path_data(blocks, src=None, dst=None):
+        if not blocks:
+            return
         fig, ax1 = plt.subplots(figsize=(8, 4))
-        
-        # Sort blocks by creation time
-        blocks = sorted(blocks, key=lambda b: b.creationTime)
+        # Sort blocks by network-entry time (after gateway filling).
+        blocks = sorted(blocks, key=lambda b: b.timeAtFull)
         
         # Extract times and latencies (converted to ms)
-        creation_times = np.array([block.creationTime for block in blocks]) * 1000  # ms
-        arrival_times = np.array([block.creationTime + block.totLatency for block in blocks]) * 1000  # ms
+        creation_times = np.array([block.timeAtFull for block in blocks]) * 1000  # ms
+        arrival_times = np.array([block.terminalTime for block in blocks]) * 1000  # ms
         latencies = np.array([block.totLatency * 1000 for block in blocks])  # ms
 
         # Scatter plot for packet arrival times vs latency
@@ -7291,20 +7640,24 @@ def plot_throughput_cdf(data, outputPath, bins_num=100, save=False, plot_separat
     # Group blocks by (source, destination) paths
     paths_data = defaultdict(list)
     for block in data:
+        if not block.delivered or block.totLatency is None or not block.path:
+            continue
         src = block.path[0][0]  # Source
         dst = block.path[-1][0]  # Destination
         paths_data[(src, dst)].append(block)
 
     # Helper function to plot CDF for a given set of blocks
     def plot_cdf_for_path(blocks, src=None, dst=None):
+        if not blocks:
+            return
         fig, ax = plt.subplots(figsize=(8, 4))
         
-        # Sort blocks by creation time
-        blocks = sorted(blocks, key=lambda b: b.creationTime)
+        # Sort blocks by network-entry time (after gateway filling).
+        blocks = sorted(blocks, key=lambda b: b.timeAtFull)
         
         # Extract creation times and arrival times
-        creation_times = np.array([block.creationTime for block in blocks])
-        arrival_times = np.array([block.creationTime + block.totLatency for block in blocks])
+        creation_times = np.array([block.timeAtFull for block in blocks])
+        arrival_times = np.array([block.terminalTime for block in blocks])
         
         # Define time bins and calculate throughput
         time_bins = np.linspace(min(creation_times), max(arrival_times), num=bins_num)
@@ -7354,14 +7707,16 @@ def plotSaveAllLatencies(outputPath, GTnumber, allLatencies, epsDF=None, annotat
     sns.set(font_scale=1.5)
     window_size = winSize
     marker_size = markerSize
-    df = pd.DataFrame(allLatencies, columns=['Creation Time', 'Latency', 'Arrival Time', 'Source', 
+    df = pd.DataFrame(allLatencies, columns=['Network Entry Time', 'Latency', 'Arrival Time', 'Source',
                                              'Destination', 'Block ID', 'QueueTime', 'TxTime', 'PropTime'])
     df['Block Index'] = df['Block ID'].apply(extract_block_index)
     df = df.sort_values(by=['Source', 'Destination', 'Block Index'])
     df.to_csv(outputPath + '/csv/' + "allLatencies_{}_gateways.csv".format(GTnumber))
+    if df.empty:
+        return
 
     # Convert time values to milliseconds
-    df['Creation Time'] *= 1000
+    df['Network Entry Time'] *= 1000
     df['Arrival Time']  *= 1000
     df['Latency']       *= 1000
     if epsDF is not None:
@@ -7372,7 +7727,7 @@ def plotSaveAllLatencies(outputPath, GTnumber, allLatencies, epsDF=None, annotat
     df['Latency_Rolling_Avg'] = df.groupby('Path')['Latency'].transform(lambda x: x.rolling(window=window_size).mean())
     
     # Metrics for x-axis
-    metrics = ['Arrival Time', 'Creation Time']
+    metrics = ['Arrival Time', 'Network Entry Time']
 
     # Create subplots
     fig, axes = plt.subplots(len(metrics), 2, figsize=(18, 18))
@@ -7384,8 +7739,8 @@ def plotSaveAllLatencies(outputPath, GTnumber, allLatencies, epsDF=None, annotat
         axes[i, 0].set_xlabel(metric + ' (ms)')
         axes[i, 0].set_ylabel('Average Latency (ms)')
 
-        # Annotate minimum latency for Creation Time only
-        if annotate_min_latency and metric == 'Creation Time':
+        # Annotate minimum latency for network-entry time only.
+        if annotate_min_latency and metric == 'Network Entry Time':
             unique_paths = df['Path'].unique()
             for path in unique_paths:
                 df_path = df[df['Path'] == path]
@@ -7621,7 +7976,8 @@ def RunSimulation(GTs, inputPath, outputPath, populationData, radioKM):
             print(f'DataBlocks lost: {earth1.lostBlocks}')
             
             # save & plot ftirst 2 GTs path latencies
-            plotSavePathLatencies(outputPath, GTnumber, pathBlocks)
+            if pathBlocks[1]:
+                plotSavePathLatencies(outputPath, GTnumber, pathBlocks)
 
             # Throughput figures
             print('Plotting Throughput...')
@@ -7656,18 +8012,22 @@ def RunSimulation(GTs, inputPath, outputPath, populationData, radioKM):
                 print('Plotting latencies...')
                 plotSaveAllLatencies(outputPath, GTnumber, allLatencies)
 
-        plotShortestPath(earth1, pathBlocks[1][-1].path, outputPath)
+        if pathBlocks[1]:
+            plotShortestPath(earth1, pathBlocks[1][-1].path, outputPath)
         if not onlinePhase:
             plotQueues(earth1.queues, outputPath, GTnumber)
 
         print('Plotting link congestion figures...')
-        plotCongestionMap(earth1, np.asarray(blocks), outputPath + '/Congestion_Test/', GTnumber, plot_separately=plotAllCon)
+        deliveredBlocksForPlots = [block for block in blocks if block.delivered]
+        if deliveredBlocksForPlots:
+            plotCongestionMap(earth1, np.asarray(deliveredBlocksForPlots), outputPath + '/Congestion_Test/', GTnumber, plot_separately=plotAllCon)
 
         print(f"number of gateways: {GTnumber}")
-        print('Path:')
-        print(pathBlocks[1][-1].path)
-        print('Bottleneck:')
-        print(findBottleneck(pathBlocks[1][-1].path, earth1))
+        if pathBlocks[1]:
+            print('Path:')
+            print(pathBlocks[1][-1].path)
+            print('Bottleneck:')
+            print(findBottleneck(pathBlocks[1][-1].path, earth1))
 
         '''
         # add data for percentages bar plot
