@@ -87,6 +87,7 @@ from collections import deque
 GAT_K_HOPS = 1          # 可改为 1 / 2 / 3
 GAT_HEADS = 4
 GAT_HIDDEN_DIM = 32
+GAT_ACTIONS = ('U', 'D', 'R', 'L')
 GAT_FEATURE_NAMES = (
     'buffer_utilization',
     'multiscale_queue_trend',
@@ -100,6 +101,17 @@ GAT_FEATURE_NAMES = (
     'is_previous_hop'
 )
 GAT_FEATURE_DIM = len(GAT_FEATURE_NAMES)
+GAT_ACTION_QUEUE_FEATURE_NAMES = (
+    'isl_u_queue_utilization',
+    'isl_d_queue_utilization',
+    'isl_r_queue_utilization',
+    'isl_l_queue_utilization'
+)
+GAT_ACTION_QUEUE_FEATURE_INDICES = tuple(
+    GAT_FEATURE_NAMES.index(feature_name)
+    for feature_name in GAT_ACTION_QUEUE_FEATURE_NAMES
+)
+GAT_ACTION_CONTEXT_DIM = len(GAT_ACTIONS) + 1
 
 # GAT 网络不能加载旧的全连接 qNetwork_*.h5
 gat_nnpath = './NNs/gat_qNetwork_2GTs.keras'    
@@ -108,7 +120,7 @@ gat_nnpathTarget = './NNs/gat_qTarget_2GTs.keras'
 # HOT PARAMS - This parameters should be revised before every simulation
 pathings    = ['hop', 'dataRate', 'dataRateOG', 'slant_range', 'Q-Learning', 'Deep Q-Learning', 'GAT-DQN']
 #pathing     = pathings[5]# dataRateOG is the original datarate. If we want to maximize the datarate we have to use dataRate, which is the inverse of the datarate
-pathing = 'Deep Q-Learning'
+pathing = 'GAT-DQN'
 
 RL_PATHINGS = ('Q-Learning', 'Deep Q-Learning', 'GAT-DQN')
 DEEP_RL_PATHINGS = ('Deep Q-Learning', 'GAT-DQN')
@@ -121,13 +133,13 @@ plotAllCon  = False      # If True, it plots congestion maps for each single pat
 movementTime= 0.1        # Every movementTime seconds, the satellites positions are updated and the graph is built again
                         # If do not want the constellation to move, set this parameter to a bigger number than the simulation time
 ndeltas     = 5805.44/20#1 Movement speedup factor. Every movementTime sats will move movementTime*ndeltas space. If bigger, will make the rotation distance bigger
-ENABLE_QUEUE_SAMPLING = True  # If True, record periodic satellite queue snapshots to CSV
+ENABLE_QUEUE_SAMPLING = False  # If True, record periodic satellite queue snapshots to CSV
 QUEUE_SAMPLE_INTERVAL_S = 0.0005  # Fixed simulation-time interval for satellite queue snapshots
 
-Train       = False      # Global for all scenarios with different number of GTs. if set to false, the model will not train any of them
-explore     = False      # If True, makes random actions eventually, if false only exploitation
-importQVals = True     # imports either QTables or NN from a certain path
-onlinePhase = True     # when set to true, each satellite becomes a different agent. Recommended using this with importQVals=True and explore=False
+Train       = True      # Global for all scenarios with different number of GTs. if set to false, the model will not train any of them
+explore     = True      # If True, makes random actions eventually, if false only exploitation
+importQVals = False     # imports either QTables or NN from a certain path
+onlinePhase = False     # when set to true, each satellite becomes a different agent. Recommended using this with importQVals=True and explore=False
 if onlinePhase:         # Just in case
     explore     = False
     importQVals = True
@@ -1992,6 +2004,29 @@ class DataBlock:
         )
 
 
+def rebuildQPathFromCurrentSatellite(block, sat, nextHop):
+    """Rebuild the untraversed QPath suffix without removing the resident sat."""
+    current_indices = [
+        index
+        for index, step in enumerate(block.QPath)
+        if isinstance(step, (list, tuple)) and step and step[0] == sat.ID
+    ]
+    if not current_indices:
+        raise ValueError(
+            f'Satellite {sat.ID} not found in the QPath for block {block.ID}: '
+            f'{block.QPath}'
+        )
+
+    destination = block.QPath[-1]
+    current_index = current_indices[-1]
+    updated_path = block.QPath[:current_index + 1]
+
+    if nextHop != 0:
+        updated_path.append(nextHop)
+    updated_path.append(destination)
+    block.QPath = updated_path
+
+
 # @profile
 class Gateway:
     """
@@ -3627,12 +3662,22 @@ class Earth:
 
                         if nextHop is None:
                             print(f'Something wrong with block: {block}')
-                        
-                        elif nextHop != 0:
-                            block.QPath[-2] = nextHop
                             pathPlot = block.QPath.copy()
-                            pathPlot.pop()
+
+                        elif nextHop != -1:
+                            rebuildQPathFromCurrentSatellite(
+                                block, sat, nextHop
+                            )
+                            if nextHop != 0:
+                                pathPlot = block.QPath.copy()
+                                pathPlot.pop()
+                            else:
+                                pathPlot = block.QPath.copy()
                         else:
+                            print(
+                                f'No route available while rerouting block '
+                                f'{block.ID} at satellite {sat.ID}'
+                            )
                             pathPlot = block.QPath.copy()
 
                         # If plotPath plots an image for every action taken. Prints 1/10 of blocks. # ANCHOR plot action earth 1
@@ -3691,11 +3736,20 @@ class Earth:
                                                                                       0].graph,
                                                                                   sat.orbPlane.earth)
 
-                        if nextHop != 0:
-                            block.QPath[-2] = nextHop
-                            pathPlot = block.QPath.copy()
-                            pathPlot.pop()
+                        if nextHop != -1:
+                            rebuildQPathFromCurrentSatellite(
+                                block, sat, nextHop
+                            )
+                            if nextHop != 0:
+                                pathPlot = block.QPath.copy()
+                                pathPlot.pop()
+                            else:
+                                pathPlot = block.QPath.copy()
                         else:
+                            print(
+                                f'No route available while rerouting block '
+                                f'{block.ID} at satellite {sat.ID}'
+                            )
                             pathPlot = block.QPath.copy()
 
                         # If plotPath plots an image for every action taken. Prints 1/10 of blocks. # ANCHOR plot action earth 2
@@ -3752,11 +3806,20 @@ class Earth:
                                                                                   0].graph,
                                                                               sat.orbPlane.earth)
 
-                    if nextHop != 0:
-                        block.QPath[-2] = nextHop
-                        pathPlot = block.QPath.copy()
-                        pathPlot.pop()
+                    if nextHop != -1:
+                        rebuildQPathFromCurrentSatellite(
+                            block, sat, nextHop
+                        )
+                        if nextHop != 0:
+                            pathPlot = block.QPath.copy()
+                            pathPlot.pop()
+                        else:
+                            pathPlot = block.QPath.copy()
                     else:
+                        print(
+                            f'No route available while rerouting block '
+                            f'{block.ID} at satellite {sat.ID}'
+                        )
                         pathPlot = block.QPath.copy()
 
                     # If plotPath plots an image for every action taken. Prints 1/10 of blocks. # ANCHOR plot action earth 3
@@ -5166,6 +5229,58 @@ class ActionNodeGather(keras.layers.Layer):
         )
 
 
+@keras.utils.register_keras_serializable(package='gat_dqn')
+class GATActionContext(keras.layers.Layer):
+    """Bind each U/D/R/L action to its direction and root egress queue."""
+
+    def __init__(self, queue_feature_indices, action_size=4, **kwargs):
+        super().__init__(**kwargs)
+        self.queue_feature_indices = tuple(queue_feature_indices)
+        self.action_size = int(action_size)
+
+        if len(self.queue_feature_indices) != self.action_size:
+            raise ValueError(
+                'Each GAT action must have exactly one directional queue '
+                'feature index.'
+            )
+
+    def call(self, node_features):
+        node_features = tf.cast(node_features, tf.float32)
+
+        # Node 0 is always the root/current satellite. Read the queue values
+        # saved in this replay state rather than live satellite state.
+        root_features = node_features[:, 0, :]
+        action_queues = tf.gather(
+            root_features,
+            indices=self.queue_feature_indices,
+            axis=-1
+        )
+        action_queues = action_queues[:, :, None]  # [B, actions, 1]
+
+        direction_one_hot = tf.eye(
+            self.action_size,
+            dtype=node_features.dtype
+        )[None, :, :]
+        direction_one_hot = tf.repeat(
+            direction_one_hot,
+            repeats=tf.shape(node_features)[0],
+            axis=0
+        )  # [B, actions, actions]
+
+        return tf.concat(
+            [direction_one_hot, action_queues],
+            axis=-1
+        )  # [B, actions, actions + 1]
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'queue_feature_indices': list(self.queue_feature_indices),
+            'action_size': self.action_size
+        })
+        return config
+
+
 def create_gat_q_network(k_hops, feature_dim, hidden_dim, heads):
     node_features = keras.Input(
         shape=(None, feature_dim),
@@ -5183,7 +5298,7 @@ def create_gat_q_network(k_hops, feature_dim, hidden_dim, heads):
         name='node_mask'
     )
     action_nodes = keras.Input(
-        shape=(4,),
+        shape=(len(GAT_ACTIONS),),
         dtype=tf.int32,
         name='action_nodes'
     )
@@ -5202,16 +5317,24 @@ def create_gat_q_network(k_hops, feature_dim, hidden_dim, heads):
             name=f'gat_layer_{layer_index + 1}'
         )([x, adjacency, node_mask])
 
-    root_embedding = RootNodeReadout(name='root_readout')(x)       # [B, H]
-    root_embedding = keras.layers.RepeatVector(4)(root_embedding) # [B, 4, H]
+    root_embedding = RootNodeReadout(name='root_readout')(x)  # [B, H]
+    root_embedding = keras.layers.RepeatVector(
+        len(GAT_ACTIONS)
+    )(root_embedding)  # [B, actions, H]
 
     action_embeddings = ActionNodeGather(name='action_gather')(
         [x, action_nodes]
-    )  # [B, 4, H]
+    )  # [B, actions, H]
+
+    action_context = GATActionContext(
+        queue_feature_indices=GAT_ACTION_QUEUE_FEATURE_INDICES,
+        action_size=len(GAT_ACTIONS),
+        name='gat_action_context'
+    )(node_features)  # [B, actions, one-hot + selected root queue]
 
     action_input = keras.layers.Concatenate(axis=-1)(
-        [root_embedding, action_embeddings]
-    )  # [B, 4, 2H]
+        [root_embedding, action_embeddings, action_context]
+    )  # [B, actions, 2H + GAT_ACTION_CONTEXT_DIM]
 
     action_input = keras.layers.TimeDistributed(
         keras.layers.Dense(hidden_dim * 2, activation='relu'),
@@ -6931,9 +7054,6 @@ def getDeepLinkedSats(satA, g, earth):
     return linkedSats
 
 # k-hop 子图、去重、邻接矩阵和批处理代码
-GAT_ACTIONS = ('U', 'D', 'R', 'L')
-
-
 def _wrapped_longitude_difference(lon_to, lon_from):
     """返回 [-180, 180] 的经度差。"""
     return (lon_to - lon_from + 180.0) % 360.0 - 180.0
