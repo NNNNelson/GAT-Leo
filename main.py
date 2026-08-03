@@ -90,9 +90,14 @@ GAT_HIDDEN_DIM = 32
 GAT_FEATURE_NAMES = (
     'buffer_utilization',
     'multiscale_queue_trend',
+    'isl_u_queue_utilization',
+    'isl_d_queue_utilization',
+    'isl_r_queue_utilization',
+    'isl_l_queue_utilization',
     'relative_longitude',
     'relative_latitude',
-    'is_destination'
+    'is_destination',
+    'is_previous_hop'
 )
 GAT_FEATURE_DIM = len(GAT_FEATURE_NAMES)
 
@@ -103,7 +108,7 @@ gat_nnpathTarget = './NNs/gat_qTarget_2GTs.keras'
 # HOT PARAMS - This parameters should be revised before every simulation
 pathings    = ['hop', 'dataRate', 'dataRateOG', 'slant_range', 'Q-Learning', 'Deep Q-Learning', 'GAT-DQN']
 #pathing     = pathings[5]# dataRateOG is the original datarate. If we want to maximize the datarate we have to use dataRate, which is the inverse of the datarate
-pathing = 'GAT-DQN'
+pathing = 'Deep Q-Learning'
 
 RL_PATHINGS = ('Q-Learning', 'Deep Q-Learning', 'GAT-DQN')
 DEEP_RL_PATHINGS = ('Deep Q-Learning', 'GAT-DQN')
@@ -122,7 +127,7 @@ QUEUE_SAMPLE_INTERVAL_S = 0.0005  # Fixed simulation-time interval for satellite
 Train       = False      # Global for all scenarios with different number of GTs. if set to false, the model will not train any of them
 explore     = False      # If True, makes random actions eventually, if false only exploitation
 importQVals = True     # imports either QTables or NN from a certain path
-onlinePhase = False     # when set to true, each satellite becomes a different agent. Recommended using this with importQVals=True and explore=False
+onlinePhase = True     # when set to true, each satellite becomes a different agent. Recommended using this with importQVals=True and explore=False
 if onlinePhase:         # Just in case
     explore     = False
     importQVals = True
@@ -280,8 +285,8 @@ CurrentGTnumber = -1    # Number of active gateways. This number will be updated
 # nnpathTarget= './pre_trained_NNs/qTarget_8GTs_6secs_nocon.h5'
 # nnpath      = './pre_trained_NNs/qNetwork_3GTs.h5'
 # nnpathTarget= './pre_trained_NNs/qTarget_3GTs.h5'
-nnpath      = './pre_trained_NNs/qNetwork_2GTs.h5'
-nnpathTarget= './pre_trained_NNs/qTarget_2GTs.h5'
+nnpath      = './NNs/qNetwork_2GTs.h5'
+nnpathTarget= './NNs/qTarget_2GTs.h5'
 # nnpath      = './pre_trained_NNs/qNetwork_2GTs_lastHop.h5'
 # nnpathTarget= './pre_trained_NNs/qTarget_2GTs_lastHop.h5'
 tablesPath  = './pre_trained_NNs/qTablesExport_8GTs/'
@@ -1431,24 +1436,55 @@ class Satellite:
     def queueSizeBits(send_buffer):
         return sum(block.size for block in send_buffer[1])
 
-    def directionalBufferRatios(self):
-        """Return U/D/R/L per-link occupancy plus total shared occupancy."""
+    def directionalBufferRatios(self, linked_sats=None):
+        """
+        Return normalized U/D/R/L egress occupancy plus shared occupancy.
+
+        Every directional queue shares ``buffer_capacity_bits`` with the other
+        ISL/GSL queues, so each ISL occupancy is normalized by that physical
+        shared-memory capacity.  A missing link/buffer is represented by 1.0
+        (no usable residual capacity); live root actions are still controlled
+        by the GAT action mask.
+        """
+        if linked_sats is None:
+            linked_sats = {
+                'U': self.upper,
+                'D': self.lower,
+                'R': self.right,
+                'L': self.left
+            }
+
         ratios = []
-        directional_buffers = [
-            self.sendBufferSatsIntra[0] if len(self.sendBufferSatsIntra) > 0 else None,
-            self.sendBufferSatsIntra[1] if len(self.sendBufferSatsIntra) > 1 else None,
-            self.sendBufferSatsInter[0] if len(self.sendBufferSatsInter) > 0 else None,
-            self.sendBufferSatsInter[1] if len(self.sendBufferSatsInter) > 1 else None
-        ]
-        for send_buffer in directional_buffers:
-            if send_buffer is None:
+        for direction in ('U', 'D', 'R', 'L'):
+            peer = linked_sats.get(direction)
+            buffers = (
+                self.sendBufferSatsIntra
+                if direction in ('U', 'D')
+                else self.sendBufferSatsInter
+            )
+            send_buffer = None
+
+            if peer is not None:
+                send_buffer = next(
+                    (
+                        buffer for buffer in buffers
+                        if buffer[2] == peer.ID
+                    ),
+                    None
+                )
+
+            if send_buffer is None or self.buffer_capacity_bits <= 0:
                 ratios.append(1.0)
             else:
-                ratios.append(min(
-                    self.queueSizeBits(send_buffer) / self.buffer_capacity_bits,
-                    1.0
-                ))
-        ratios.append(min(self.buffer_utilization, 1.0))
+                utilization = (
+                    self.queueSizeBits(send_buffer)
+                    / self.buffer_capacity_bits
+                )
+                ratios.append(min(max(float(utilization), 0.0), 1.0))
+
+        ratios.append(
+            min(max(float(self.buffer_utilization), 0.0), 1.0)
+        )
         return ratios
 
     def createReceiveBlockProcess(self, block, propTime):
@@ -4404,6 +4440,7 @@ class hyperparam:
         self.latBias    = latBias
         self.lonBias    = lonBias
         self.diff       = diff
+        self.diffLastHop= diff_lastHop
         self.explore    = explore
         self.reducedState= reducedState
         self.online     = onlinePhase
@@ -4411,6 +4448,7 @@ class hyperparam:
         self.gatHeads = GAT_HEADS
         self.gatHiddenDim = GAT_HIDDEN_DIM
         self.gatFeatureDim = GAT_FEATURE_DIM
+        self.gatFeatureNames = GAT_FEATURE_NAMES
     def __repr__(self):
         return 'Hyperparameters:\nalpha: {}\ngamma: {}\nepsilon: {}\nw1: {}\nw2: {}\n'.format(
         self.alpha,
@@ -5248,7 +5286,9 @@ class GATDQNAgent:
                     raise ValueError(
                         f'Imported GAT {model_name} expects '
                         f'{loaded_feature_dim} node features, but the current '
-                        f'state uses {self.featureDim}. Retrain the GAT model.'
+                        f'state uses {self.featureDim}: '
+                        f'{GAT_FEATURE_NAMES}. Set importQVals=False and '
+                        f'retrain the GAT model for the expanded state.'
                     )
 
             print(f'GAT Q-network imported: {gat_nnpath}')
@@ -6919,14 +6959,21 @@ def getSatelliteMultiscaleQueueTrendFeature(sat):
     return float(sat.getMultiscaleQueueTrendFeature())
 
 
-def _normalised_queue_features(sat):
+def _normalised_queue_features(sat, directional_neighbours):
     """
-    返回缓存利用率和多尺度队列趋势两个动态特征。
+    Return normalized shared-buffer, trend, and U/D/R/L queue features.
+
+    Shared and directional queue utilizations are clipped to [0, 1].  The
+    multiscale trend is already normalized to [-1, 1].
     """
+    directional_utilizations = sat.directionalBufferRatios(
+        directional_neighbours
+    )[:4]
+
     return [
         min(max(float(sat.buffer_utilization), 0.0), 1.0),
         getSatelliteMultiscaleQueueTrendFeature(sat)
-    ]
+    ] + directional_utilizations
 
 
 def _live_directional_neighbours(sat, graph, earth):
@@ -6978,8 +7025,10 @@ def _get_previous_satellite_id(block):
     则该卫星对应节点的 is_previous_hop=1。
     """
     try:
-        if len(block.QPath) > 2:
-            return str(block.QPath[-2][0])
+        # QPath ends in [..., previous satellite, current satellite,
+        # destination gateway] while the current action is being selected.
+        if len(block.QPath) > 3:
+            return str(block.QPath[-3][0])
     except (AttributeError, IndexError, TypeError):
         pass
 
@@ -7005,15 +7054,21 @@ def build_gat_k_hop_state(block, root_sat, graph, earth, k_hops):
     nodes = [root_sat]
     node_to_index = {root_sat.ID: 0}
     frontier = [root_sat]
+    neighbour_cache = {}
+
+    def get_live_neighbours(sat):
+        if sat.ID not in neighbour_cache:
+            neighbour_cache[sat.ID] = _live_directional_neighbours(
+                sat, graph, earth
+            )
+        return neighbour_cache[sat.ID]
 
     # BFS：只扩展到 k-hop；同一卫星只添加一次。
     for _ in range(k_hops):
         next_frontier = []
 
         for current_sat in frontier:
-            neighbours = _live_directional_neighbours(
-                current_sat, graph, earth
-            )
+            neighbours = get_live_neighbours(current_sat)
 
             for direction in GAT_ACTIONS:
                 neighbour = neighbours[direction]
@@ -7039,7 +7094,7 @@ def build_gat_k_hop_state(block, root_sat, graph, earth, k_hops):
     adjacency = np.zeros((num_nodes, num_nodes), dtype=np.float32)
 
     for i, sat_i in enumerate(nodes):
-        neighbours = _live_directional_neighbours(sat_i, graph, earth)
+        neighbours = get_live_neighbours(sat_i)
 
         for direction in GAT_ACTIONS:
             sat_j = neighbours[direction]
@@ -7057,7 +7112,7 @@ def build_gat_k_hop_state(block, root_sat, graph, earth, k_hops):
     np.fill_diagonal(adjacency, 1.0)
 
     # 动作与一跳节点的对应关系。
-    root_neighbours = _live_directional_neighbours(root_sat, graph, earth)
+    root_neighbours = get_live_neighbours(root_sat)
     action_nodes = np.full(4, -1, dtype=np.int32)
 
     for action_index, direction in enumerate(GAT_ACTIONS):
@@ -7069,12 +7124,23 @@ def build_gat_k_hop_state(block, root_sat, graph, earth, k_hops):
     action_mask = (action_nodes >= 0).astype(np.float32)
 
     feature_rows = []
+    previous_satellite_id = (
+        _get_previous_satellite_id(block)
+        if diff_lastHop
+        else None
+    )
 
     for sat in nodes:
         feature_rows.append(
-            _normalised_queue_features(sat)
+            _normalised_queue_features(
+                sat,
+                get_live_neighbours(sat)
+            )
             + _relative_coordinates(sat, destination_sat)
-            + [float(sat.ID == destination_sat.ID)]
+            + [
+                float(sat.ID == destination_sat.ID),
+                float(sat.ID == previous_satellite_id)
+            ]
         )
 
     node_features = np.asarray(feature_rows, dtype=np.float32)
@@ -7083,7 +7149,7 @@ def build_gat_k_hop_state(block, root_sat, graph, earth, k_hops):
     assert adjacency.shape == (num_nodes, num_nodes)
 
     return {
-        'x': node_features,                 # [N_k, 5]
+        'x': node_features,                 # [N_k, GAT_FEATURE_DIM]
         'adj': adjacency,                   # [N_k, N_k]
         'node_ids': tuple(sat.ID for sat in nodes),
         'action_nodes': action_nodes,       # [4]
