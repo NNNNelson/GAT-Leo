@@ -2031,6 +2031,41 @@ class DataBlock:
         )
 
 
+def getCurrentSatelliteQPathIndex(block, sat):
+    current_indices = [
+        index
+        for index, step in enumerate(block.QPath)
+        if (
+            isinstance(step, (list, tuple))
+            and step
+            and step[0] == sat.ID
+        )
+    ]
+
+    if not current_indices:
+        return None
+
+    return current_indices[-1]
+
+
+def getPreviousSatelliteFromQPath(block, sat, earth):
+    current_index = getCurrentSatelliteQPathIndex(block, sat)
+
+    if current_index is None or current_index <= 0:
+        return None
+
+    previous_step = block.QPath[current_index - 1]
+
+    if not isinstance(previous_step, (list, tuple)) or not previous_step:
+        return None
+
+    previous_id = previous_step[0]
+
+    # The preceding node can be the source gateway rather than a satellite.
+    previous_sat = findByID(earth, previous_id)
+    return previous_sat
+
+
 def rebuildQPathFromCurrentSatellite(block, sat, nextHop):
     """Rebuild the untraversed QPath suffix without removing the resident sat."""
     current_indices = [
@@ -7350,20 +7385,21 @@ def _live_directional_neighbours(sat, graph, earth):
     return result
 
 
-def _get_previous_satellite_id(block):
+def _get_previous_satellite_id(block, current_sat, earth):
     """
     保留原 diff_lastHop 的信息：若上一跳是卫星，
     则该卫星对应节点的 is_previous_hop=1。
     """
-    try:
-        # QPath ends in [..., previous satellite, current satellite,
-        # destination gateway] while the current action is being selected.
-        if len(block.QPath) > 3:
-            return str(block.QPath[-3][0])
-    except (AttributeError, IndexError, TypeError):
-        pass
+    previous_satellite = getPreviousSatelliteFromQPath(
+        block,
+        current_sat,
+        earth
+    )
 
-    return None
+    if previous_satellite is None:
+        return None
+
+    return str(previous_satellite.ID)
 
 
 def build_gat_k_hop_state(block, root_sat, graph, earth, k_hops):
@@ -7456,7 +7492,7 @@ def build_gat_k_hop_state(block, root_sat, graph, earth, k_hops):
 
     feature_rows = []
     previous_satellite_id = (
-        _get_previous_satellite_id(block)
+        _get_previous_satellite_id(block, root_sat, earth)
         if diff_lastHop
         else None
     )
@@ -7686,20 +7722,25 @@ def getDeepStateDiffLastHop(block, sat, linkedSats):
         2: Right Neighbour
         3: Left  Neighbour'''
         actIndex = -1
-        try:
-            if len(block.QPath) > 2:
-                if sat.upper and sat.upper.ID == block.QPath[-2][0]:
-                    actIndex = 0
-                elif sat.lower and sat.lower.ID == block.QPath[-2][0]:
-                    actIndex = 1
-                elif sat.right and sat.right.ID == block.QPath[-2][0]:
-                    actIndex = 2
-                elif sat.left and sat.left.ID == block.QPath[-2][0]:
-                    actIndex = 3
+        previous_satellite = getPreviousSatelliteFromQPath(
+            block,
+            sat,
+            sat.orbPlane.earth
+        )
+
+        if previous_satellite is None:
             return actIndex
-        except AttributeError as e:
-            print(f'An error occurred when checking if {block.QPath[-2][0]} is a neighbour satellite of {sat.ID}')
-            return actIndex
+
+        if sat.upper and sat.upper.ID == previous_satellite.ID:
+            actIndex = 0
+        elif sat.lower and sat.lower.ID == previous_satellite.ID:
+            actIndex = 1
+        elif sat.right and sat.right.ID == previous_satellite.ID:
+            actIndex = 2
+        elif sat.left and sat.left.ID == previous_satellite.ID:
+            actIndex = 3
+
+        return actIndex
 
     satDest = block.destination.linkedSat[1]
     if satDest is None:
