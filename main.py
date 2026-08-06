@@ -211,6 +211,7 @@ avUserLoad  = 8593 * 8      # average traffic usage per second in bits
 
 # Block
 BLOCK_SIZE   = 648000
+MAX_HOPS     = 20  # Satellite nodes in QPath; source/destination gateways excluded
 SAT_BUFFER_CAPACITY_BLOCKS = 100
 SAT_BUFFER_CAPACITY_BITS = SAT_BUFFER_CAPACITY_BLOCKS * BLOCK_SIZE
 
@@ -1576,6 +1577,23 @@ class Satellite:
         block.checkPoints.append(self.env.now)
 
         earth = self.orbPlane.earth
+        hop_count = max(0, len(block.QPath) - 2)
+        at_destination_sat = (
+            self.linkedGT is not None
+            and block.destination.ID == self.linkedGT.ID
+        )
+        # The hop limit takes precedence over buffer admission.
+        if (
+            earth.pathParam in RL_PATHINGS
+            and hop_count >= MAX_HOPS
+            and not at_destination_sat
+        ):
+            record = earth.registerBlockDrop(
+                block, 'max_hops', self, release_buffer=False
+            )
+            earth.applyDropRLFeedback(block, record)
+            return
+
         if block.path == -1:
             record = earth.registerBlockDrop(
                 block, 'invalid_path', self, release_buffer=False
@@ -2739,6 +2757,7 @@ class Earth:
         self.droppedBlockIDs = set()
         self.blockDropRecords = []
         self.dropCounts = {
+            'max_hops': 0,
             'buffer_overflow': 0,
             'block_too_large': 0,
             'no_route': 0,
@@ -2926,6 +2945,10 @@ class Earth:
             findByID(self, block.oldAgentSatID)
             if block.oldAgentSatID is not None else None
         )
+        if self.pathParam == 'Q-Learning':
+            if decision_sat is None:
+                return None, None
+            return decision_sat.QLearning, decision_sat
         if self.DDQNA is not None:
             return self.DDQNA, decision_sat
         if decision_sat is None:
@@ -2933,54 +2956,70 @@ class Earth:
         return decision_sat.DDQNA, decision_sat
 
     def applyDropRLFeedback(self, block, drop_record):
-        """Store one terminal transition for the satellite action that caused a drop."""
+        """Apply one terminal update to the satellite action that caused a drop."""
         if drop_record is None or block.dropFeedbackStored:
             return False
         if block.oldState is None or block.oldAction is None:
             return False
 
         agent, decision_sat = self.resolveDecisionAgent(block)
-        if agent is None or not hasattr(agent, 'experienceReplay'):
+        if agent is None:
             return False
 
-        gat_drop_reward = getattr(agent, 'computeDropReward', None)
-        if callable(gat_drop_reward):
-            drop_sat = findByID(self, block.dropSatID)
-            reward = gat_drop_reward(
-                block,
-                decision_sat,
-                drop_sat,
-                block.dropReason
-            )
-            if reward is None:
+        if isinstance(agent, QLearning):
+            if block.dropReason != 'max_hops':
                 return False
-        else:
-            # Preserve the existing dense-DDQN terminal feedback unchanged.
-            if block.dropReason not in (
-                'buffer_overflow',
-                'block_too_large'
-            ):
-                return False
-            reward = BUFFER_OVERFLOW_REWARD
 
-        agent.experienceReplay.store(
-            block.oldState,
-            block.oldAction,
-            reward,
-            block.oldState,
-            True
-        )
+            reward = BUFFER_OVERFLOW_REWARD
+            old_q_value = agent.qTable[block.oldState][block.oldAction]
+            agent.qTable[block.oldState][block.oldAction] = (
+                (1 - agent.alpha) * old_q_value
+                + agent.alpha * reward
+            )
+        else:
+            if not hasattr(agent, 'experienceReplay'):
+                return False
+
+            gat_drop_reward = getattr(agent, 'computeDropReward', None)
+            if callable(gat_drop_reward):
+                drop_sat = findByID(self, block.dropSatID)
+                reward = gat_drop_reward(
+                    block,
+                    decision_sat,
+                    drop_sat,
+                    block.dropReason
+                )
+                if reward is None:
+                    return False
+            else:
+                # Preserve the existing dense-DDQN terminal feedback unchanged.
+                if block.dropReason not in (
+                    'max_hops',
+                    'buffer_overflow',
+                    'block_too_large'
+                ):
+                    return False
+                reward = BUFFER_OVERFLOW_REWARD
+
+            agent.experienceReplay.store(
+                block.oldState,
+                block.oldAction,
+                reward,
+                block.oldState,
+                True
+            )
+
+            agent.transitionCount += 1
+            if TrainThis and agent.transitionCount % nTrain == 0:
+                log_sat = decision_sat or findByID(self, block.dropSatID)
+                if log_sat is not None:
+                    agent.train(log_sat, self)
+
         block.dropReward = reward
         block.dropFeedbackStored = True
         self.rewards.append([reward, self.env.now])
         drop_record['drop_reward'] = reward
         drop_record['rl_feedback_stored'] = True
-
-        agent.transitionCount += 1
-        if TrainThis and agent.transitionCount % nTrain == 0:
-            log_sat = decision_sat or findByID(self, block.dropSatID)
-            if log_sat is not None:
-                agent.train(log_sat, self)
         return True
 
     def saveBlockDropRecords(self, output_path):
@@ -4746,6 +4785,7 @@ class QLearning:
         # this will be saved always, except when the next hop is the destination, where the process will have already returned
         block.oldState  = newState
         block.oldAction = self.actions.index(action)
+        block.oldAgentSatID = sat.ID
 
         earth.step += 1
 
@@ -5823,7 +5863,7 @@ class GATDQNAgent:
         reason
     ):
         """Return a GAT-only terminal reward, or None for exogenous drops."""
-        if reason not in ('buffer_overflow', 'no_route'):
+        if reason not in ('max_hops', 'buffer_overflow', 'no_route'):
             return None
         if decision_sat is None:
             return None
