@@ -11,6 +11,13 @@ from scipy.optimize import linear_sum_assignment
 import pickle
 import random
 import os
+
+SEED = int(os.environ.get("EXPERIMENT_SEED", "1"))
+
+# These flags must be set before TensorFlow is imported.
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+os.environ.setdefault("TF_CUDNN_DETERMINISTIC", "1")
+
 import folium
 from IPython.display import display
 from typing import List, Tuple
@@ -68,6 +75,11 @@ from keras.optimizers import Adam
 from keras.layers import Dense, Embedding, Reshape, Input, Conv2D, Flatten
 from collections import deque
 
+random.seed(SEED)
+np.random.seed(SEED)
+tf.keras.utils.set_random_seed(SEED)
+tf.config.experimental.enable_op_determinism()
+
 # Forcing TensorFlow to use GPU - No worth using GPU for reinforcement learning in this case 
 #                                 since the training is done every step with small buffers
 # physical_devices = tf.config.list_physical_devices('GPU')
@@ -120,12 +132,15 @@ GAT_TREND_FEATURE_INDEX = GAT_FEATURE_NAMES.index(
 # GAT-DQN-only dense reward.  The tabular Q-Learning and dense DDQN agents
 # continue to use ArriveReward, againPenalty, BUFFER_OVERFLOW_REWARD, and the
 # shared distance/queue reward helpers below.
-GAT_REWARD_PROGRESS_WEIGHT = 0.30
-GAT_REWARD_CONGESTION_WEIGHT = 0.50
+# Keep the existing "progress" name for configuration compatibility; this
+# component is now potential-based shaping toward the fixed destination GT.
+GAT_REWARD_PROGRESS_WEIGHT = 0.15
+GAT_REWARD_CONGESTION_WEIGHT = 0.30
 GAT_REWARD_QUEUE_WEIGHT = 0.20
+GAT_REWARD_HOP_WEIGHT = 0.25
+GAT_REWARD_REPEAT_WEIGHT = 0.05
 
-GAT_PROGRESS_SCALE = 2.0
-GAT_PROGRESS_HOP_COST = 0.20
+GAT_HOP_PENALTY = -1.0
 
 GAT_CONGESTION_ROOT_QUEUE_WEIGHT = 0.45
 GAT_CONGESTION_NEXT_BUFFER_WEIGHT = 0.40
@@ -135,10 +150,12 @@ GAT_CONGESTION_STEEPNESS = 12.0
 
 GAT_QUEUE_TIME_SCALE_S = 0.009
 
+# Terminal magnitudes are blending strengths, not directly added rewards.
 GAT_ARRIVAL_BONUS = 4.0
 GAT_REPEAT_PENALTY = -1.0
 GAT_OVERFLOW_PENALTY = -5.0
 GAT_NO_ROUTE_PENALTY = -4.0
+GAT_MAX_HOPS_PENALTY = -4.0
 
 # GAT 网络不能加载旧的全连接 qNetwork_*.h5
 gat_nnpath = './NNs/gat_qNetwork_2GTs.keras'    
@@ -147,7 +164,7 @@ gat_nnpathTarget = './NNs/gat_qTarget_2GTs.keras'
 # HOT PARAMS - This parameters should be revised before every simulation
 pathings    = ['hop', 'dataRate', 'dataRateOG', 'slant_range', 'Q-Learning', 'Deep Q-Learning', 'GAT-DQN']
 #pathing     = pathings[5]# dataRateOG is the original datarate. If we want to maximize the datarate we have to use dataRate, which is the inverse of the datarate
-pathing = 'Deep Q-Learning'
+pathing = 'GAT-DQN'
 
 RL_PATHINGS = ('Q-Learning', 'Deep Q-Learning', 'GAT-DQN')
 DEEP_RL_PATHINGS = ('Deep Q-Learning', 'GAT-DQN')
@@ -157,16 +174,16 @@ plotSatID   = True      # If True, plots the ID of each satellite
 plotAllThro = False      # If True, it plots throughput plots for each single path between gateways. If False, it plots a single figure for overall Throughput
 plotAllCon  = False      # If True, it plots congestion maps for each single path between gateways. If False, it plots a single figure for overall congestion
 
-movementTime= 0.1        # Every movementTime seconds, the satellites positions are updated and the graph is built again
+movementTime= 0.05        # Every movementTime seconds, the satellites positions are updated and the graph is built again
                         # If do not want the constellation to move, set this parameter to a bigger number than the simulation time
 ndeltas     = 5805.44/20#1 Movement speedup factor. Every movementTime sats will move movementTime*ndeltas space. If bigger, will make the rotation distance bigger
 ENABLE_QUEUE_SAMPLING = False  # If True, record periodic satellite queue snapshots to CSV
 QUEUE_SAMPLE_INTERVAL_S = 0.0005  # Fixed simulation-time interval for satellite queue snapshots
 
-Train       = False      # Global for all scenarios with different number of GTs. if set to false, the model will not train any of them
-explore     = False      # If True, makes random actions eventually, if false only exploitation
-importQVals = True     # imports either QTables or NN from a certain path
-onlinePhase = True     # when set to true, each satellite becomes a different agent. Recommended using this with importQVals=True and explore=False
+Train       = True      # Global for all scenarios with different number of GTs. if set to false, the model will not train any of them
+explore     = True      # If True, makes random actions eventually, if false only exploitation
+importQVals = False     # imports either QTables or NN from a certain path
+onlinePhase = False     # when set to true, each satellite becomes a different agent. Recommended using this with importQVals=True and explore=False
 if onlinePhase:         # Just in case
     explore     = False
     importQVals = True
@@ -211,7 +228,7 @@ avUserLoad  = 8593 * 8      # average traffic usage per second in bits
 
 # Block
 BLOCK_SIZE   = 648000
-MAX_HOPS     = 20  # Satellite nodes in QPath; source/destination gateways excluded
+MAX_HOPS     = 50  # Satellite nodes in QPath; source/destination gateways excluded
 SAT_BUFFER_CAPACITY_BLOCKS = 100
 SAT_BUFFER_CAPACITY_BITS = SAT_BUFFER_CAPACITY_BLOCKS * BLOCK_SIZE
 
@@ -341,7 +358,7 @@ if __name__ == '__main__':
 
 receivedDataBlocks  = []
 createdBlocks       = []
-seed                = np.random.seed(1)
+seed                = SEED
 upGSLRates          = []
 downGSLRates        = []
 interRates          = []
@@ -4635,8 +4652,9 @@ class hyperparam:
             self.gatProgressWeight = GAT_REWARD_PROGRESS_WEIGHT
             self.gatCongestionWeight = GAT_REWARD_CONGESTION_WEIGHT
             self.gatQueueWeight = GAT_REWARD_QUEUE_WEIGHT
-            self.gatProgressScale = GAT_PROGRESS_SCALE
-            self.gatProgressHopCost = GAT_PROGRESS_HOP_COST
+            self.gatHopWeight = GAT_REWARD_HOP_WEIGHT
+            self.gatRepeatWeight = GAT_REWARD_REPEAT_WEIGHT
+            self.gatHopPenalty = GAT_HOP_PENALTY
             self.gatCongestionRootWeight = (
                 GAT_CONGESTION_ROOT_QUEUE_WEIGHT
             )
@@ -4651,6 +4669,7 @@ class hyperparam:
             self.gatRepeatPenalty = GAT_REPEAT_PENALTY
             self.gatOverflowPenalty = GAT_OVERFLOW_PENALTY
             self.gatNoRoutePenalty = GAT_NO_ROUTE_PENALTY
+            self.gatMaxHopsPenalty = GAT_MAX_HOPS_PENALTY
     def __repr__(self):
         return 'Hyperparameters:\nalpha: {}\ngamma: {}\nepsilon: {}\nw1: {}\nw2: {}\n'.format(
         self.alpha,
@@ -5520,8 +5539,9 @@ class GATDQNAgent:
         self.gatProgressWeight = hyperparams.gatProgressWeight
         self.gatCongestionWeight = hyperparams.gatCongestionWeight
         self.gatQueueWeight = hyperparams.gatQueueWeight
-        self.gatProgressScale = hyperparams.gatProgressScale
-        self.gatProgressHopCost = hyperparams.gatProgressHopCost
+        self.gatHopWeight = hyperparams.gatHopWeight
+        self.gatRepeatWeight = hyperparams.gatRepeatWeight
+        self.gatHopPenalty = hyperparams.gatHopPenalty
         self.gatCongestionRootWeight = hyperparams.gatCongestionRootWeight
         self.gatCongestionNextWeight = hyperparams.gatCongestionNextWeight
         self.gatCongestionTrendWeight = hyperparams.gatCongestionTrendWeight
@@ -5532,6 +5552,18 @@ class GATDQNAgent:
         self.gatRepeatPenalty = hyperparams.gatRepeatPenalty
         self.gatOverflowPenalty = hyperparams.gatOverflowPenalty
         self.gatNoRoutePenalty = hyperparams.gatNoRoutePenalty
+        self.gatMaxHopsPenalty = hyperparams.gatMaxHopsPenalty
+
+        orbital_radii = (
+            float(satellite.r)
+            for plane in getattr(earth, 'LEO', ())
+            for satellite in getattr(plane, 'sats', ())
+            if math.isfinite(float(satellite.r))
+        )
+        self.gatPotentialDistanceScale = Re + max(
+            orbital_radii,
+            default=Re
+        )
 
         self.step = 0
         self.i = 0
@@ -5706,30 +5738,45 @@ class GATDQNAgent:
 
         return float(root_queue), float(next_buffer), float(next_trend)
 
-    def _progress_reward(self, prev_sat, next_sat, destination_sat):
-        """Bounded, scale-independent progress toward the destination."""
-        if prev_sat is None or next_sat is None or destination_sat is None:
+    def _progress_reward(
+        self,
+        prev_sat,
+        next_sat,
+        destination,
+        terminal=False
+    ):
+        """Potential-based shaping toward the fixed destination gateway."""
+        if prev_sat is None or next_sat is None or destination is None:
             return 0.0
 
-        previous_distance = getSlantRange(prev_sat, destination_sat)
-        next_distance = getSlantRange(next_sat, destination_sat)
-        travel_distance = getSlantRange(prev_sat, next_sat)
+        previous_distance = getSlantRange(prev_sat, destination)
+        next_distance = getSlantRange(next_sat, destination)
+        distance_scale = float(self.gatPotentialDistanceScale)
 
         if (
             not math.isfinite(previous_distance)
             or not math.isfinite(next_distance)
-            or not math.isfinite(travel_distance)
-            or travel_distance <= 0.0
+            or not math.isfinite(distance_scale)
+            or distance_scale <= 0.0
         ):
             return 0.0
 
-        progress_ratio = np.clip(
-            (previous_distance - next_distance) / travel_distance,
+        previous_potential = -float(np.clip(
+            previous_distance / distance_scale,
+            0.0,
+            1.0
+        ))
+        next_potential = 0.0 if terminal else -float(np.clip(
+            next_distance / distance_scale,
+            0.0,
+            1.0
+        ))
+
+        return float(np.clip(
+            self.gamma * next_potential - previous_potential,
             -1.0,
             1.0
-        )
-        shaped_progress = progress_ratio - self.gatProgressHopCost
-        return math.tanh(self.gatProgressScale * shaped_progress)
+        ))
 
     def _congestion_reward(self, state, action):
         """Non-linear penalty based only on the action-time snapshot."""
@@ -5784,13 +5831,6 @@ class GATDQNAgent:
         return -math.tanh(scaled_delay ** 2)
 
     @staticmethod
-    def _destination_satellite(block):
-        linked_satellite = getattr(block.destination, 'linkedSat', None)
-        if not linked_satellite or len(linked_satellite) < 2:
-            return None
-        return linked_satellite[1]
-
-    @staticmethod
     def _is_repeated_satellite(block, satellite):
         if satellite is None:
             return False
@@ -5819,12 +5859,19 @@ class GATDQNAgent:
         block,
         prev_sat,
         next_sat,
-        include_queue_delay=True
+        include_queue_delay=True,
+        include_hop_cost=True,
+        include_progress=True,
+        terminal=False
     ):
-        progress_reward = self._progress_reward(
-            prev_sat,
-            next_sat,
-            self._destination_satellite(block)
+        progress_reward = (
+            self._progress_reward(
+                prev_sat,
+                next_sat,
+                block.destination,
+                terminal=terminal
+            )
+            if include_progress else 0.0
         )
         congestion_reward = self._congestion_reward(
             block.oldState,
@@ -5834,26 +5881,46 @@ class GATDQNAgent:
             self._queue_delay_reward(block)
             if include_queue_delay else 0.0
         )
+        hop_reward = self.gatHopPenalty if include_hop_cost else 0.0
+        repeat_reward = (
+            self.gatRepeatPenalty
+            if self._is_repeated_satellite(block, next_sat) else 0.0
+        )
 
         reward = (
             self.gatProgressWeight * progress_reward
             + self.gatCongestionWeight * congestion_reward
             + self.gatQueueWeight * queue_reward
+            + self.gatHopWeight * hop_reward
+            + self.gatRepeatWeight * repeat_reward
         )
 
-        if self._is_repeated_satellite(block, next_sat):
-            reward += self.gatRepeatPenalty
-
-        return float(reward)
+        return float(np.clip(reward, -1.0, 1.0))
 
     def _transition_reward(self, block, prev_sat, sat):
         return self._dense_reward(block, prev_sat, sat)
 
     def _arrival_reward(self, block, prev_sat, sat):
-        return (
-            self._dense_reward(block, prev_sat, sat)
-            + self.gatArrivalBonus
+        dense_reward = self._dense_reward(
+            block,
+            prev_sat,
+            sat,
+            terminal=True
         )
+        return self._terminal_reward(
+            dense_reward,
+            outcome=1.0,
+            strength=abs(self.gatArrivalBonus)
+        )
+
+    @staticmethod
+    def _terminal_reward(dense_reward, outcome, strength):
+        """Blend dense and terminal feedback while keeping [-1, 1]."""
+        strength = max(float(strength), 0.0)
+        reward = (
+            float(dense_reward) + strength * float(outcome)
+        ) / (1.0 + strength)
+        return float(np.clip(reward, -1.0, 1.0))
 
     def computeDropReward(
         self,
@@ -5870,6 +5937,8 @@ class GATDQNAgent:
 
         reward_next_sat = drop_sat
         include_queue_delay = True
+        include_hop_cost = True
+        include_progress = True
 
         # A no-route failure can occur immediately after selecting a neighbor,
         # before that action has queued or transmitted the block.  In that case
@@ -5881,17 +5950,31 @@ class GATDQNAgent:
         ):
             reward_next_sat = self._selected_next_satellite(block)
             include_queue_delay = False
+            include_hop_cost = False
+            include_progress = False
 
         dense_reward = self._dense_reward(
             block,
             decision_sat,
             reward_next_sat,
-            include_queue_delay=include_queue_delay
+            include_queue_delay=include_queue_delay,
+            include_hop_cost=include_hop_cost,
+            include_progress=include_progress,
+            terminal=True
         )
 
         if reason == 'buffer_overflow':
-            return dense_reward + self.gatOverflowPenalty
-        return dense_reward + self.gatNoRoutePenalty
+            strength = abs(self.gatOverflowPenalty)
+        elif reason == 'max_hops':
+            strength = abs(self.gatMaxHopsPenalty)
+        else:
+            strength = abs(self.gatNoRoutePenalty)
+
+        return self._terminal_reward(
+            dense_reward,
+            outcome=-1.0,
+            strength=strength
+        )
 
     def makeDeepAction(self, block, sat, graph, earth, prevSat=None):
         graph_state = build_gat_k_hop_state(
@@ -8022,16 +8105,18 @@ def saveHyperparams(outputPath, inputParams, hyperparams):
     gat_reward_params = []
     if hyperparams.pathing == 'GAT-DQN':
         gat_reward_params = [
-            'GAT progress reward weight: '
+            'GAT potential reward weight: '
             + str(hyperparams.gatProgressWeight),
             'GAT congestion reward weight: '
             + str(hyperparams.gatCongestionWeight),
             'GAT queue reward weight: '
             + str(hyperparams.gatQueueWeight),
-            'GAT progress scale: '
-            + str(hyperparams.gatProgressScale),
-            'GAT progress hop cost: '
-            + str(hyperparams.gatProgressHopCost),
+            'GAT hop reward weight: '
+            + str(hyperparams.gatHopWeight),
+            'GAT repeat reward weight: '
+            + str(hyperparams.gatRepeatWeight),
+            'GAT hop penalty: '
+            + str(hyperparams.gatHopPenalty),
             'GAT congestion root queue weight: '
             + str(hyperparams.gatCongestionRootWeight),
             'GAT congestion next buffer weight: '
@@ -8051,7 +8136,9 @@ def saveHyperparams(outputPath, inputParams, hyperparams):
             'GAT overflow penalty: '
             + str(hyperparams.gatOverflowPenalty),
             'GAT no-route penalty: '
-            + str(hyperparams.gatNoRoutePenalty)
+            + str(hyperparams.gatNoRoutePenalty),
+            'GAT max-hops penalty: '
+            + str(hyperparams.gatMaxHopsPenalty)
         ]
 
     hyperparams = ['Constellation: ' + str(inputParams['Constellation'][0]),
